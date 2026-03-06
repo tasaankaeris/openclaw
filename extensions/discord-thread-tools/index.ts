@@ -590,7 +590,7 @@ function createDiscordDmSendTool(ctx: OpenClawPluginToolContext): AnyAgentTool {
       additionalProperties: false,
     },
     async execute(_toolCallId, rawArgs) {
-      ensureDiscordContext(ctx);
+      // DM tools allow any channel (webchat, CLI, etc.); explicit accountId+userId.
       const cfg = requireConfig(ctx.config);
       const args = rawArgs as Record<string, unknown>;
       const accountId = readStringParam(args, "accountId", { required: true });
@@ -764,7 +764,7 @@ function createDiscordDmReactTool(ctx: OpenClawPluginToolContext): AnyAgentTool 
       additionalProperties: false,
     },
     async execute(_toolCallId, rawArgs) {
-      ensureDiscordContext(ctx);
+      // DM tools allow any channel (webchat, CLI, etc.); explicit accountId+channelId.
       const cfg = requireConfig(ctx.config);
       const args = rawArgs as Record<string, unknown>;
       const accountId = readStringParam(args, "accountId", { required: true });
@@ -831,7 +831,7 @@ function createDiscordDmAttachTool(ctx: OpenClawPluginToolContext): AnyAgentTool
       additionalProperties: false,
     },
     async execute(_toolCallId, rawArgs) {
-      ensureDiscordContext(ctx);
+      // DM tools allow any channel (webchat, CLI, etc.); explicit accountId+channelId.
       const cfg = requireConfig(ctx.config);
       const args = rawArgs as Record<string, unknown>;
       const accountId = readStringParam(args, "accountId", { required: true });
