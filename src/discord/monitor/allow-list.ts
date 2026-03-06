@@ -16,13 +16,15 @@ export type DiscordAllowList = {
 
 export type DiscordAllowListMatch = AllowlistMatch<"wildcard" | "id" | "name" | "tag">;
 
+const DISCORD_OWNER_ALLOWLIST_PREFIXES = ["discord:", "user:", "pk:"];
+
 export type DiscordGuildEntryResolved = {
   id?: string;
   slug?: string;
   requireMention?: boolean;
   reactionNotifications?: "off" | "own" | "all" | "allowlist";
-  users?: Array<string | number>;
-  roles?: Array<string | number>;
+  users?: string[];
+  roles?: string[];
   channels?: Record<
     string,
     {
@@ -30,8 +32,8 @@ export type DiscordGuildEntryResolved = {
       requireMention?: boolean;
       skills?: string[];
       enabled?: boolean;
-      users?: Array<string | number>;
-      roles?: Array<string | number>;
+      users?: string[];
+      roles?: string[];
       systemPrompt?: string;
       includeThreadStarter?: boolean;
       autoThread?: boolean;
@@ -44,8 +46,8 @@ export type DiscordChannelConfigResolved = {
   requireMention?: boolean;
   skills?: string[];
   enabled?: boolean;
-  users?: Array<string | number>;
-  roles?: Array<string | number>;
+  users?: string[];
+  roles?: string[];
   systemPrompt?: string;
   includeThreadStarter?: boolean;
   autoThread?: boolean;
@@ -53,10 +55,7 @@ export type DiscordChannelConfigResolved = {
   matchSource?: ChannelMatchSource;
 };
 
-export function normalizeDiscordAllowList(
-  raw: Array<string | number> | undefined,
-  prefixes: string[],
-) {
+export function normalizeDiscordAllowList(raw: string[] | undefined, prefixes: string[]) {
   if (!raw || raw.length === 0) {
     return null;
   }
@@ -101,6 +100,7 @@ export function normalizeDiscordSlug(value: string) {
 export function allowListMatches(
   list: DiscordAllowList,
   candidate: { id?: string; name?: string; tag?: string },
+  params?: { allowNameMatching?: boolean },
 ) {
   if (list.allowAll) {
     return true;
@@ -108,12 +108,14 @@ export function allowListMatches(
   if (candidate.id && list.ids.has(candidate.id)) {
     return true;
   }
-  const slug = candidate.name ? normalizeDiscordSlug(candidate.name) : "";
-  if (slug && list.names.has(slug)) {
-    return true;
-  }
-  if (candidate.tag && list.names.has(normalizeDiscordSlug(candidate.tag))) {
-    return true;
+  if (params?.allowNameMatching === true) {
+    const slug = candidate.name ? normalizeDiscordSlug(candidate.name) : "";
+    if (slug && list.names.has(slug)) {
+      return true;
+    }
+    if (candidate.tag && list.names.has(normalizeDiscordSlug(candidate.tag))) {
+      return true;
+    }
   }
   return false;
 }
@@ -121,6 +123,7 @@ export function allowListMatches(
 export function resolveDiscordAllowListMatch(params: {
   allowList: DiscordAllowList;
   candidate: { id?: string; name?: string; tag?: string };
+  allowNameMatching?: boolean;
 }): DiscordAllowListMatch {
   const { allowList, candidate } = params;
   if (allowList.allowAll) {
@@ -129,39 +132,46 @@ export function resolveDiscordAllowListMatch(params: {
   if (candidate.id && allowList.ids.has(candidate.id)) {
     return { allowed: true, matchKey: candidate.id, matchSource: "id" };
   }
-  const nameSlug = candidate.name ? normalizeDiscordSlug(candidate.name) : "";
-  if (nameSlug && allowList.names.has(nameSlug)) {
-    return { allowed: true, matchKey: nameSlug, matchSource: "name" };
-  }
-  const tagSlug = candidate.tag ? normalizeDiscordSlug(candidate.tag) : "";
-  if (tagSlug && allowList.names.has(tagSlug)) {
-    return { allowed: true, matchKey: tagSlug, matchSource: "tag" };
+  if (params.allowNameMatching === true) {
+    const nameSlug = candidate.name ? normalizeDiscordSlug(candidate.name) : "";
+    if (nameSlug && allowList.names.has(nameSlug)) {
+      return { allowed: true, matchKey: nameSlug, matchSource: "name" };
+    }
+    const tagSlug = candidate.tag ? normalizeDiscordSlug(candidate.tag) : "";
+    if (tagSlug && allowList.names.has(tagSlug)) {
+      return { allowed: true, matchKey: tagSlug, matchSource: "tag" };
+    }
   }
   return { allowed: false };
 }
 
 export function resolveDiscordUserAllowed(params: {
-  allowList?: Array<string | number>;
+  allowList?: string[];
   userId: string;
   userName?: string;
   userTag?: string;
+  allowNameMatching?: boolean;
 }) {
   const allowList = normalizeDiscordAllowList(params.allowList, ["discord:", "user:", "pk:"]);
   if (!allowList) {
     return true;
   }
-  return allowListMatches(allowList, {
-    id: params.userId,
-    name: params.userName,
-    tag: params.userTag,
-  });
+  return allowListMatches(
+    allowList,
+    {
+      id: params.userId,
+      name: params.userName,
+      tag: params.userTag,
+    },
+    { allowNameMatching: params.allowNameMatching },
+  );
 }
 
 export function resolveDiscordRoleAllowed(params: {
-  allowList?: Array<string | number>;
+  allowList?: string[];
   memberRoleIds: string[];
 }) {
-  // Role allowlists accept role IDs only (string or number). Names are ignored.
+  // Role allowlists accept role IDs only. Names are ignored.
   const allowList = normalizeDiscordAllowList(params.allowList, ["role:"]);
   if (!allowList) {
     return true;
@@ -173,12 +183,13 @@ export function resolveDiscordRoleAllowed(params: {
 }
 
 export function resolveDiscordMemberAllowed(params: {
-  userAllowList?: Array<string | number>;
-  roleAllowList?: Array<string | number>;
+  userAllowList?: string[];
+  roleAllowList?: string[];
   memberRoleIds: string[];
   userId: string;
   userName?: string;
   userTag?: string;
+  allowNameMatching?: boolean;
 }) {
   const hasUserRestriction = Array.isArray(params.userAllowList) && params.userAllowList.length > 0;
   const hasRoleRestriction = Array.isArray(params.roleAllowList) && params.roleAllowList.length > 0;
@@ -191,6 +202,7 @@ export function resolveDiscordMemberAllowed(params: {
         userId: params.userId,
         userName: params.userName,
         userTag: params.userTag,
+        allowNameMatching: params.allowNameMatching,
       })
     : false;
   const roleOk = hasRoleRestriction
@@ -207,6 +219,7 @@ export function resolveDiscordMemberAccessState(params: {
   guildInfo?: DiscordGuildEntryResolved | null;
   memberRoleIds: string[];
   sender: { id: string; name?: string; tag?: string };
+  allowNameMatching?: boolean;
 }) {
   const channelUsers = params.channelConfig?.users ?? params.guildInfo?.users;
   const channelRoles = params.channelConfig?.roles ?? params.guildInfo?.roles;
@@ -220,6 +233,7 @@ export function resolveDiscordMemberAccessState(params: {
     userId: params.sender.id,
     userName: params.sender.name,
     userTag: params.sender.tag,
+    allowNameMatching: params.allowNameMatching,
   });
   return { channelUsers, channelRoles, hasAccessRestrictions, memberAllowed } as const;
 }
@@ -228,6 +242,7 @@ export function resolveDiscordOwnerAllowFrom(params: {
   channelConfig?: DiscordChannelConfigResolved | null;
   guildInfo?: DiscordGuildEntryResolved | null;
   sender: { id: string; name?: string; tag?: string };
+  allowNameMatching?: boolean;
 }): string[] | undefined {
   const rawAllowList = params.channelConfig?.users ?? params.guildInfo?.users;
   if (!Array.isArray(rawAllowList) || rawAllowList.length === 0) {
@@ -244,6 +259,7 @@ export function resolveDiscordOwnerAllowFrom(params: {
       name: params.sender.name,
       tag: params.sender.tag,
     },
+    allowNameMatching: params.allowNameMatching,
   });
   if (!match.allowed || !match.matchKey || match.matchKey === "*") {
     return undefined;
@@ -251,11 +267,38 @@ export function resolveDiscordOwnerAllowFrom(params: {
   return [match.matchKey];
 }
 
+export function resolveDiscordOwnerAccess(params: {
+  allowFrom?: string[];
+  sender: { id: string; name?: string; tag?: string };
+  allowNameMatching?: boolean;
+}): {
+  ownerAllowList: DiscordAllowList | null;
+  ownerAllowed: boolean;
+} {
+  const ownerAllowList = normalizeDiscordAllowList(
+    params.allowFrom,
+    DISCORD_OWNER_ALLOWLIST_PREFIXES,
+  );
+  const ownerAllowed = ownerAllowList
+    ? allowListMatches(
+        ownerAllowList,
+        {
+          id: params.sender.id,
+          name: params.sender.name,
+          tag: params.sender.tag,
+        },
+        { allowNameMatching: params.allowNameMatching },
+      )
+    : false;
+  return { ownerAllowList, ownerAllowed };
+}
+
 export function resolveDiscordCommandAuthorized(params: {
   isDirectMessage: boolean;
-  allowFrom?: Array<string | number>;
+  allowFrom?: string[];
   guildInfo?: DiscordGuildEntryResolved | null;
   author: User;
+  allowNameMatching?: boolean;
 }) {
   if (!params.isDirectMessage) {
     return true;
@@ -264,11 +307,15 @@ export function resolveDiscordCommandAuthorized(params: {
   if (!allowList) {
     return true;
   }
-  return allowListMatches(allowList, {
-    id: params.author.id,
-    name: params.author.username,
-    tag: formatDiscordUserTag(params.author),
-  });
+  return allowListMatches(
+    allowList,
+    {
+      id: params.author.id,
+      name: params.author.username,
+      tag: formatDiscordUserTag(params.author),
+    },
+    { allowNameMatching: params.allowNameMatching },
+  );
 }
 
 export function resolveDiscordGuildEntry(params: {
@@ -478,7 +525,7 @@ export function isDiscordGroupAllowedByPolicy(params: {
 }
 
 export function resolveGroupDmAllow(params: {
-  channels?: Array<string | number>;
+  channels?: string[];
   channelId: string;
   channelName?: string;
   channelSlug: string;
@@ -503,7 +550,8 @@ export function shouldEmitDiscordReactionNotification(params: {
   userId: string;
   userName?: string;
   userTag?: string;
-  allowlist?: Array<string | number>;
+  allowlist?: string[];
+  allowNameMatching?: boolean;
 }) {
   const mode = params.mode ?? "own";
   if (mode === "off") {
@@ -520,11 +568,15 @@ export function shouldEmitDiscordReactionNotification(params: {
     if (!list) {
       return false;
     }
-    return allowListMatches(list, {
-      id: params.userId,
-      name: params.userName,
-      tag: params.userTag,
-    });
+    return allowListMatches(
+      list,
+      {
+        id: params.userId,
+        name: params.userName,
+        tag: params.userTag,
+      },
+      { allowNameMatching: params.allowNameMatching },
+    );
   }
   return false;
 }

@@ -1,11 +1,15 @@
-import type { AuthProfileCredential, AuthProfileStore } from "./types.js";
 import { normalizeSecretInput } from "../../utils/normalize-secret-input.js";
-import { normalizeProviderId } from "../model-selection.js";
+import { normalizeProviderId, normalizeProviderIdForAuth } from "../model-selection.js";
 import {
   ensureAuthProfileStore,
   saveAuthProfileStore,
   updateAuthProfileStoreWithLock,
 } from "./store.js";
+import type { AuthProfileCredential, AuthProfileStore } from "./types.js";
+
+export function dedupeProfileIds(profileIds: string[]): string[] {
+  return [...new Set(profileIds)];
+}
 
 export async function setAuthProfileOrder(params: {
   agentDir?: string;
@@ -17,13 +21,7 @@ export async function setAuthProfileOrder(params: {
     params.order && Array.isArray(params.order)
       ? params.order.map((entry) => String(entry).trim()).filter(Boolean)
       : [];
-
-  const deduped: string[] = [];
-  for (const entry of sanitized) {
-    if (!deduped.includes(entry)) {
-      deduped.push(entry);
-    }
-  }
+  const deduped = dedupeProfileIds(sanitized);
 
   return await updateAuthProfileStoreWithLock({
     agentDir: params.agentDir,
@@ -81,9 +79,9 @@ export async function upsertAuthProfileWithLock(params: {
 }
 
 export function listProfilesForProvider(store: AuthProfileStore, provider: string): string[] {
-  const providerKey = normalizeProviderId(provider);
+  const providerKey = normalizeProviderIdForAuth(provider);
   return Object.entries(store.profiles)
-    .filter(([, cred]) => normalizeProviderId(cred.provider) === providerKey)
+    .filter(([, cred]) => normalizeProviderIdForAuth(cred.provider) === providerKey)
     .map(([id]) => id);
 }
 

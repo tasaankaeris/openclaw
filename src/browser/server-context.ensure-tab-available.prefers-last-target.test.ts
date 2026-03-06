@@ -1,29 +1,8 @@
-import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { withFetchPreconnect } from "../test-utils/fetch-mock.js";
 import type { BrowserServerState } from "./server-context.js";
+import "./server-context.chrome-test-harness.js";
 import { createBrowserRouteContext } from "./server-context.js";
-
-const chromeUserDataDir = vi.hoisted(() => ({ dir: "/tmp/openclaw" }));
-
-beforeAll(async () => {
-  chromeUserDataDir.dir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-chrome-user-data-"));
-});
-
-afterAll(async () => {
-  await fs.rm(chromeUserDataDir.dir, { recursive: true, force: true });
-});
-
-vi.mock("./chrome.js", () => ({
-  isChromeCdpReady: vi.fn(async () => true),
-  isChromeReachable: vi.fn(async () => true),
-  launchOpenClawChrome: vi.fn(async () => {
-    throw new Error("unexpected launch");
-  }),
-  resolveOpenClawUserDataDir: vi.fn(() => chromeUserDataDir.dir),
-  stopOpenClawChrome: vi.fn(async () => {}),
-}));
 
 function makeBrowserState(): BrowserServerState {
   return {
@@ -33,9 +12,15 @@ function makeBrowserState(): BrowserServerState {
     resolved: {
       enabled: true,
       controlPort: 18791,
+      cdpPortRangeStart: 18800,
+      cdpPortRangeEnd: 18899,
       cdpProtocol: "http",
       cdpHost: "127.0.0.1",
       cdpIsLoopback: true,
+      evaluateEnabled: false,
+      remoteCdpTimeoutMs: 1500,
+      remoteCdpHandshakeTimeoutMs: 3000,
+      extraArgs: [],
       color: "#FF4500",
       headless: true,
       noSandbox: false,
@@ -74,7 +59,7 @@ function stubChromeJsonList(responses: unknown[]) {
     } as unknown as Response;
   });
 
-  global.fetch = fetchMock;
+  global.fetch = withFetchPreconnect(fetchMock);
   return fetchMock;
 }
 

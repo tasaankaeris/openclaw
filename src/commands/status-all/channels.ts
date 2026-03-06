@@ -1,16 +1,18 @@
 import fs from "node:fs";
+import {
+  buildChannelAccountSnapshot,
+  formatChannelAllowFrom,
+  resolveChannelAccountConfigured,
+  resolveChannelAccountEnabled,
+} from "../../channels/account-summary.js";
+import { resolveChannelDefaultAccountId } from "../../channels/plugins/helpers.js";
+import { listChannelPlugins } from "../../channels/plugins/index.js";
 import type {
   ChannelAccountSnapshot,
   ChannelId,
   ChannelPlugin,
 } from "../../channels/plugins/types.js";
 import type { OpenClawConfig } from "../../config/config.js";
-import {
-  buildChannelAccountSnapshot,
-  formatChannelAllowFrom,
-} from "../../channels/account-summary.js";
-import { resolveChannelDefaultAccountId } from "../../channels/plugins/helpers.js";
-import { listChannelPlugins } from "../../channels/plugins/index.js";
 import { sha256HexPrefix } from "../../logging/redact-identifier.js";
 import { formatTimeAgo } from "./format.js";
 
@@ -83,30 +85,6 @@ const formatAccountLabel = (params: { accountId: string; name?: string }) => {
     return `${base} (${params.name.trim()})`;
   }
   return base;
-};
-
-const resolveAccountEnabled = (
-  plugin: ChannelPlugin,
-  account: unknown,
-  cfg: OpenClawConfig,
-): boolean => {
-  if (plugin.config.isEnabled) {
-    return plugin.config.isEnabled(account, cfg);
-  }
-  const enabled = asRecord(account).enabled;
-  return enabled !== false;
-};
-
-const resolveAccountConfigured = async (
-  plugin: ChannelPlugin,
-  account: unknown,
-  cfg: OpenClawConfig,
-): Promise<boolean> => {
-  if (plugin.config.isConfigured) {
-    return await plugin.config.isConfigured(account, cfg);
-  }
-  const configured = asRecord(account).configured;
-  return configured !== false;
 };
 
 const buildAccountNotes = (params: {
@@ -211,14 +189,15 @@ function summarizeTokenConfig(params: {
   }
 
   const accountRecs = enabled.map((a) => asRecord(a.account));
-  const hasBotOrAppTokenFields = accountRecs.some((r) => "botToken" in r || "appToken" in r);
+  const hasBotTokenField = accountRecs.some((r) => "botToken" in r);
+  const hasAppTokenField = accountRecs.some((r) => "appToken" in r);
   const hasTokenField = accountRecs.some((r) => "token" in r);
 
-  if (!hasBotOrAppTokenFields && !hasTokenField) {
+  if (!hasBotTokenField && !hasAppTokenField && !hasTokenField) {
     return { state: null, detail: null };
   }
 
-  if (hasBotOrAppTokenFields) {
+  if (hasBotTokenField && hasAppTokenField) {
     const ready = enabled.filter((a) => {
       const rec = asRecord(a.account);
       const bot = typeof rec.botToken === "string" ? rec.botToken.trim() : "";
@@ -262,6 +241,30 @@ function summarizeTokenConfig(params: {
     return {
       state: "ok",
       detail: `tokens ok (bot ${botSources.label}, app ${appSources.label})${hint} · accounts ${ready.length}/${enabled.length || 1}`,
+    };
+  }
+
+  if (hasBotTokenField) {
+    const ready = enabled.filter((a) => {
+      const rec = asRecord(a.account);
+      const bot = typeof rec.botToken === "string" ? rec.botToken.trim() : "";
+      return Boolean(bot);
+    });
+
+    if (ready.length === 0) {
+      return { state: "setup", detail: "no bot token" };
+    }
+
+    const sample = ready[0]?.account ? asRecord(ready[0].account) : {};
+    const botToken = typeof sample.botToken === "string" ? sample.botToken : "";
+    const botHint = botToken.trim()
+      ? formatTokenHint(botToken, { showSecrets: params.showSecrets })
+      : "";
+    const hint = botHint ? ` (${botHint})` : "";
+
+    return {
+      state: "ok",
+      detail: `bot token config${hint} · accounts ${ready.length}/${enabled.length || 1}`,
     };
   }
 
@@ -318,8 +321,13 @@ export async function buildChannelsTable(
     const accounts: ChannelAccountRow[] = [];
     for (const accountId of resolvedAccountIds) {
       const account = plugin.config.resolveAccount(cfg, accountId);
-      const enabled = resolveAccountEnabled(plugin, account, cfg);
-      const configured = await resolveAccountConfigured(plugin, account, cfg);
+      const enabled = resolveChannelAccountEnabled({ plugin, account, cfg });
+      const configured = await resolveChannelAccountConfigured({
+        plugin,
+        account,
+        cfg,
+        readAccountConfiguredField: true,
+      });
       const snapshot = buildChannelAccountSnapshot({
         plugin,
         cfg,
