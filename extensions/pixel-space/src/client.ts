@@ -77,7 +77,7 @@ export async function pixelApiFetch(
   }
   if (!response.ok) {
     const msg =
-      (data.error as string) ?? (data.message as string) ?? body || `HTTP ${response.status}`;
+      (data.error as string) ?? (data.message as string) ?? (body || `HTTP ${response.status}`);
     throw new Error(`pixel-space API error (${response.status}): ${msg}`);
   }
   return data;

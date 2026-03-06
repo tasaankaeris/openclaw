@@ -166,10 +166,14 @@ async function loadAttachmentPayload(params: {
       accountId: params.accountId,
       resolveChannelLimitMb: () => undefined,
     }) ?? DISCORD_ATTACHMENT_MAX_BYTES;
+  // Per-agent workspace-* dirs (e.g. workspace-prism) are blocked by default localRoots
+  // hardening; pass explicit localRoots so attachments under the agent workspace are allowed.
+  const localRoots = params.workspaceDir ? [path.resolve(params.workspaceDir)] : undefined;
   let media: Awaited<ReturnType<typeof loadWebMedia>>;
   try {
     media = await loadWebMedia(safePath, {
       maxBytes,
+      localRoots,
       readFile: (p: string) => fs.readFile(p),
     });
   } catch (err) {
