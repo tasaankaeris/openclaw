@@ -252,3 +252,7 @@
   - changed-files:
       - any-glob-to-any-file:
           - "extensions/talk-voice/**"
+"extensions: pixel-space":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "extensions/pixel-space/**"

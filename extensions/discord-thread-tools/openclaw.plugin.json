@@ -1,0 +1,25 @@
+{
+  "id": "discord-thread-tools",
+  "name": "Discord Thread Tools",
+  "description": "Intentful Discord thread tools (create/send/react/attach).",
+  "version": "0.0.1",
+  "entry": "./index.ts",
+  "kind": "plugin",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "guildId": {
+        "type": "string",
+        "description": "Discord guild (server) ID where thread tools are allowed."
+      },
+      "parentChannels": {
+        "type": "object",
+        "description": "Mapping of logical parent channel keys (e.g. general, system, ops) to Discord channel IDs.",
+        "additionalProperties": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

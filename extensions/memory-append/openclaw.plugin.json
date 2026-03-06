@@ -1,0 +1,9 @@
+{
+  "id": "memory-append",
+  "name": "Memory Append",
+  "description": "Append structured entries into daily memory Markdown files (memory/YYYY-MM-DD.md).",
+  "version": "0.0.1",
+  "entry": "./index.ts",
+  "kind": "plugin",
+  "configSchema": {}
+}

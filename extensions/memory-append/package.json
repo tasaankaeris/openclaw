@@ -1,0 +1,10 @@
+{
+  "name": "@openclaw/memory-append",
+  "version": "0.0.1",
+  "description": "Append structured lines into daily memory Markdown files (memory/YYYY-MM-DD.md).",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "openclaw": "workspace:*"
+  }
+}

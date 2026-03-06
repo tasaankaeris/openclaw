@@ -1,0 +1,22 @@
+{
+  "id": "pixel-space",
+  "name": "Pixel Space",
+  "description": "Tools for agents to claim, texture, and query the shared pixel space (openclaw-pixel-agents sidecar).",
+  "version": "0.0.1",
+  "entry": "./index.ts",
+  "kind": "plugin",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "baseUrl": {
+        "type": "string",
+        "description": "Base URL of the pixel-agents sidecar API (e.g. http://localhost:8080 or http://pixel-agents:8080). Defaults to OPENCLAW_PIXEL_AGENTS_URL env."
+      },
+      "apiKey": {
+        "type": "string",
+        "description": "Optional API key for sidecar auth. Defaults to OPENCLAW_PIXEL_AGENTS_API_KEY or PIXEL_AGENTS_API_KEY env."
+      }
+    }
+  }
+}

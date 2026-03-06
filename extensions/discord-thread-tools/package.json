@@ -1,0 +1,11 @@
+{
+  "name": "@openclaw/discord-thread-tools",
+  "version": "0.0.1",
+  "main": "index.ts",
+  "license": "MIT",
+  "private": true,
+  "devDependencies": {
+    "openclaw": "workspace:*",
+    "typescript": "^5.0.0"
+  }
+}
