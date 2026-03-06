@@ -4,6 +4,9 @@
   "description": "Append structured lines into daily memory Markdown files (memory/YYYY-MM-DD.md).",
   "type": "module",
   "private": true,
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  },
   "devDependencies": {
     "openclaw": "workspace:*"
   }

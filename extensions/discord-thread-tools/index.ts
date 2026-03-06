@@ -112,35 +112,13 @@ import {
 
 const DISCORD_API_BASE = "https://discord.com/api/v10";
 
-/**
- * Workaround: Core may report channel=whatsapp when only Discord is configured
- * (DEFAULT_CHAT_CHANNEL fallback). Allow when sessionKey indicates Discord or Discord
- * is configured and WhatsApp is not.
- */
 function ensureDiscordContext(ctx: OpenClawPluginToolContext): void {
   const channel = (ctx.messageChannel ?? "").trim().toLowerCase();
-  if (channel === "discord") {
-    return;
+  if (channel !== "discord") {
+    throw new Error(
+      `discord-thread tools are only allowed in Discord sessions (got channel=${channel || "unknown"}).`,
+    );
   }
-  const sessionKey = (ctx.sessionKey ?? "").trim().toLowerCase();
-  if (sessionKey.includes(":discord:")) {
-    return;
-  }
-  const cfg = ctx.config;
-  const discordConfigured =
-    cfg?.channels?.discord != null &&
-    typeof cfg.channels.discord === "object" &&
-    (cfg.channels.discord as { enabled?: boolean }).enabled !== false;
-  const whatsappConfigured =
-    cfg?.channels?.whatsapp != null &&
-    typeof cfg.channels.whatsapp === "object" &&
-    (cfg.channels.whatsapp as { enabled?: boolean }).enabled !== false;
-  if (discordConfigured && !whatsappConfigured && (channel === "whatsapp" || !channel)) {
-    return;
-  }
-  throw new Error(
-    `discord-thread tools are only allowed in Discord sessions (got channel=${channel || "unknown"}).`,
-  );
 }
 
 function requireConfig(cfg?: OpenClawConfig): OpenClawConfig {

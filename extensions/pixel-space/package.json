@@ -4,6 +4,9 @@
   "description": "OpenClaw tools for pixel-space: claim, texture, shift, release, query, asset register/query.",
   "type": "module",
   "private": true,
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  },
   "devDependencies": {
     "openclaw": "workspace:*",
     "vitest": "^2.1.0"
