@@ -1,9 +1,34 @@
 {
   "id": "memory-append",
   "name": "Memory Append",
-  "description": "Append structured entries into daily memory Markdown files (memory/YYYY-MM-DD.md).",
+  "description": "Append structured entries into daily memory Markdown files (memory/YYYY-MM-DD.md). Delegates to the Go binary for locking and formatting.",
   "version": "0.0.1",
   "entry": "./index.ts",
   "kind": "plugin",
-  "configSchema": {}
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "registryUrl": {
+        "type": "string",
+        "description": "Project registry API base URL for Discord channel/thread → project resolution."
+      },
+      "registryToken": {
+        "type": "string",
+        "description": "Key name in registryEnvFile (or OS environment) that holds the registry auth secret. The literal secret value is never stored here."
+      },
+      "registryEnvFile": {
+        "type": "string",
+        "description": "Path to .env file containing the registryToken key. Defaults to '.env' in the workspace root."
+      },
+      "binaryPath": {
+        "type": "string",
+        "description": "Explicit path to the memory-append Go binary. Overrides sandbox/host defaults."
+      },
+      "discordAccountId": {
+        "type": "string",
+        "description": "Discord bot account id for registry resolution. Defaults to ctx.agentAccountId."
+      }
+    }
+  }
 }
