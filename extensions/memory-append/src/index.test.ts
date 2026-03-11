@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import type { Mock } from "vitest";
 import type { OpenClawConfig, OpenClawPluginApi, PluginLogger } from "openclaw/plugin-sdk";
-import plugin, { createMemoryAppendTool } from "../index.js";
+import plugin, { createMemoryAppendTool, shouldBlockManualMemoryEdit } from "../index.js";
 
 vi.mock("node:child_process", () => ({
   spawn: vi.fn(),
@@ -37,11 +38,11 @@ vi.mock("./helpers.js", async () => {
       return null;
     },
     resolveDiscordBotToken: vi.fn(() => "bot-token"),
-    resolveDiscordChannelContextType: vi.fn(async () => "thread" as const),
+    resolveDiscordChannelContextType: vi.fn(async () => "channel" as const),
   };
 });
 
-const spawnMock = vi.mocked(await import("node:child_process")).spawn as unknown as vi.Mock;
+const spawnMock = vi.mocked(await import("node:child_process")).spawn as unknown as Mock;
 
 function createTestLogger(): PluginLogger {
   return {
@@ -63,7 +64,7 @@ describe("memory-append plugin", () => {
     const api: OpenClawPluginApi = {
       pluginConfig: {},
       logger: createTestLogger(),
-      registerTool(factory) {
+      registerTool(factory: (ctx: unknown) => unknown) {
         const tool = factory({
           workspaceDir: "/workspace",
         } as any);
@@ -93,11 +94,18 @@ describe("memory-append plugin", () => {
       logger,
     );
 
-    const on = vi.fn();
+    const stdoutOn = vi.fn();
+    const stderrOn = vi.fn();
+    const procOn = vi.fn((event: string, handler: (...args: any[]) => void) => {
+      if (event === "close") {
+        handler(0, null);
+      }
+    });
+
     spawnMock.mockReturnValue({
-      stdout: { on } as any,
-      stderr: { on } as any,
-      on: vi.fn(),
+      stdout: { on: stdoutOn } as any,
+      stderr: { on: stderrOn } as any,
+      on: procOn as any,
       kill: vi.fn(),
     } as any);
 
@@ -126,6 +134,48 @@ describe("memory-append plugin", () => {
     expect((result as any).ok).toBe(true);
   });
 
+  it("builds the correct command-line when an explicit threadId is provided", async () => {
+    const logger = createTestLogger();
+    const tool = createMemoryAppendTool(
+      {
+        workspaceDir: "/workspace",
+        sessionKey: "agent:nexus:discord:channel:123",
+        agentAccountId: "nexus",
+        config: {} as OpenClawConfig,
+      } as any,
+      {},
+      logger,
+    );
+
+    const stdoutOn = vi.fn();
+    const stderrOn = vi.fn();
+    const procOn = vi.fn((event: string, handler: (...args: any[]) => void) => {
+      if (event === "close") {
+        handler(0, null);
+      }
+    });
+
+    spawnMock.mockReturnValue({
+      stdout: { on: stdoutOn } as any,
+      stderr: { on: stderrOn } as any,
+      on: procOn as any,
+      kill: vi.fn(),
+    } as any);
+
+    const result = await tool!.execute("call-1", {
+      text: "hello thread",
+      priority: "daily",
+      threadId: "999",
+    });
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    const [binary, args] = spawnMock.mock.calls[0]!;
+    expect(binary).toBe("memory-append");
+    expect(args).toContain("--thread");
+    expect(args).toContain("999");
+    expect((result as any).ok).toBe(true);
+  });
+
   it("fails with a clear error when the binary is missing", async () => {
     const logger = createTestLogger();
     const tool = createMemoryAppendTool(
@@ -145,5 +195,28 @@ describe("memory-append plugin", () => {
     expect((result as any).ok).toBe(false);
     expect((result as any).error).toMatch("Memory append binary not found");
   });
-}
+
+  it("shouldBlockManualMemoryEdit blocks write/edit/apply_patch to daily memory files", () => {
+    const paramsList: Record<string, unknown>[] = [
+      { path: "memory/2026-03-11.md" },
+      { path: "subdir/memory/2026-03-11.md" },
+      { path: "C:\\workspace\\memory\\2026-03-11.md" },
+      { files: ["other.txt", "memory/2026-03-11.md"] },
+    ];
+
+    for (const params of paramsList) {
+      expect(shouldBlockManualMemoryEdit("write", params)).toBe(true);
+      expect(shouldBlockManualMemoryEdit("edit", params)).toBe(true);
+      expect(shouldBlockManualMemoryEdit("apply_patch", params)).toBe(true);
+    }
+  });
+
+  it("shouldBlockManualMemoryEdit ignores non-memory paths and other tools", () => {
+    const params = { path: "notes/2026-03-11.md" };
+    expect(shouldBlockManualMemoryEdit("write", params)).toBe(false);
+    expect(shouldBlockManualMemoryEdit("edit", params)).toBe(false);
+    expect(shouldBlockManualMemoryEdit("apply_patch", params)).toBe(false);
+    expect(shouldBlockManualMemoryEdit("read", { path: "memory/2026-03-11.md" })).toBe(false);
+  });
+});
 

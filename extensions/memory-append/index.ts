@@ -1,5 +1,10 @@
 import { spawn } from "node:child_process";
-import type { AnyAgentTool, OpenClawConfig, OpenClawPluginApi, PluginLogger } from "openclaw/plugin-sdk";
+import type {
+  AnyAgentTool,
+  OpenClawConfig,
+  OpenClawPluginApi,
+  PluginLogger,
+} from "openclaw/plugin-sdk";
 import { jsonResult, readStringParam } from "openclaw/plugin-sdk";
 import {
   normalizeTags,
@@ -43,6 +48,95 @@ type MemoryAppendPluginConfig = {
   binaryPath?: string;
   discordAccountId?: string;
 };
+
+function isDailyMemoryPath(rawPath: string): boolean {
+  const normalized = rawPath.replace(/\\/g, "/");
+  const lastSlash = normalized.lastIndexOf("/");
+  const filename = lastSlash >= 0 ? normalized.slice(lastSlash + 1) : normalized;
+  if (!/^\d{4}-\d{2}-\d{2}\.md$/u.test(filename)) return false;
+  const lower = normalized.toLowerCase();
+  return lower.includes("/memory/") || lower.startsWith("memory/");
+}
+
+function extractPathsFromParams(params: Record<string, unknown>): string[] {
+  const paths: string[] = [];
+
+  const add = (value: unknown) => {
+    if (typeof value === "string") {
+      paths.push(value);
+    } else if (Array.isArray(value)) {
+      for (const entry of value) {
+        if (typeof entry === "string") paths.push(entry);
+      }
+    }
+  };
+
+  add((params as any).path);
+  add((params as any).file);
+  add((params as any).files);
+  add((params as any).paths);
+
+  return paths;
+}
+
+function extractPathsFromPatchParams(params: Record<string, unknown>): string[] {
+  const paths: string[] = [];
+
+  const addFromPatchString = (patch: string) => {
+    const lines = patch.split(/\r?\n/u);
+    for (const line of lines) {
+      const match = line.match(/^\*\*\* (?:Add|Update) File: (.+)$/u);
+      if (match && match[1]) {
+        paths.push(match[1].trim());
+      }
+    }
+  };
+
+  const rawPatch = (params as any).patch;
+  const rawPatches = (params as any).patches;
+
+  if (typeof rawPatch === "string") {
+    addFromPatchString(rawPatch);
+  } else if (Array.isArray(rawPatch)) {
+    for (const entry of rawPatch) {
+      if (typeof entry === "string") addFromPatchString(entry);
+    }
+  }
+
+  if (typeof rawPatches === "string") {
+    addFromPatchString(rawPatches);
+  } else if (Array.isArray(rawPatches)) {
+    for (const entry of rawPatches) {
+      if (typeof entry === "string") addFromPatchString(entry);
+    }
+  }
+
+  return paths;
+}
+
+export function shouldBlockManualMemoryEdit(
+  toolName: string,
+  params: Record<string, unknown>,
+): boolean {
+  const lowerName = toolName.toLowerCase();
+  const isFsWriteTool =
+    lowerName === "write" ||
+    lowerName === "edit" ||
+    lowerName === "apply_patch" ||
+    lowerName === "delete" ||
+    lowerName === "unlink" ||
+    lowerName === "remove" ||
+    lowerName === "rename" ||
+    lowerName === "move";
+
+  if (!isFsWriteTool) return false;
+
+  const candidatePaths = [
+    ...extractPathsFromParams(params),
+    ...extractPathsFromPatchParams(params),
+  ];
+  return candidatePaths.some(isDailyMemoryPath);
+}
 
 const MEMORY_APPEND_PARAMETERS_SCHEMA = {
   type: "object",
@@ -199,6 +293,7 @@ function createMemoryAppendTool(
         const proc = spawn(binaryPath, cmdArgs, {
           stdio: ["ignore", "pipe", "pipe"],
           env: process.env,
+          cwd: workspaceDir,
         });
         const stdoutChunks: Buffer[] = [];
         const stderrChunks: Buffer[] = [];
@@ -228,6 +323,7 @@ function createMemoryAppendTool(
         });
 
         let exitCode: number | null = null;
+        let exitSignal: NodeJS.Signals | null = null;
 
         await new Promise<void>((resolve, reject) => {
           let settled = false;
@@ -262,10 +358,11 @@ function createMemoryAppendTool(
             );
           }, MEMORY_APPEND_HARD_TIMEOUT_MS);
 
-          proc.on("close", (code) => {
+          proc.on("close", (code, signal) => {
             clearTimeout(softTimeout);
             clearTimeout(hardTimeout);
             exitCode = typeof code === "number" ? code : null;
+            exitSignal = (signal as NodeJS.Signals | null) ?? null;
             done();
           });
           proc.on("error", (err) => {
@@ -280,7 +377,21 @@ function createMemoryAppendTool(
         const out = [stdout, stderr].filter(Boolean).join("\n").trim();
         if (out) logger.debug?.(`memory-append output (captured tail): ${out}`);
 
-        if (exitCode !== null && exitCode !== 0) {
+        if (exitSignal) {
+          return jsonResult({
+            ok: false,
+            error: `Memory append process was terminated by signal ${exitSignal}.`,
+          });
+        }
+
+        if (exitCode === null) {
+          return jsonResult({
+            ok: false,
+            error: "Memory append process exited with unknown status.",
+          });
+        }
+
+        if (exitCode !== 0) {
           const stderrTail = stderr.slice(-512).trim();
           const messageParts = [
             `memory-append exited with code ${exitCode}.`,
@@ -365,6 +476,21 @@ const plugin = {
     const pluginCfg = (api.pluginConfig ?? {}) as MemoryAppendPluginConfig;
     api.registerTool((ctx) => createMemoryAppendTool(ctx, pluginCfg, api.logger), {
       optional: false,
+    });
+    // Enforce append-only daily memory policy: block generic filesystem tools from
+    // directly modifying memory/YYYY-MM-DD.md so all writes go through memory_append.
+    api.on("before_tool_call", (event) => {
+      if (shouldBlockManualMemoryEdit(event.toolName, event.params)) {
+        api.logger.debug?.(
+          `memory-append: blocking ${event.toolName} for daily memory path to enforce memory_append.`,
+        );
+        return {
+          block: true,
+          blockReason:
+            "Direct edits to daily memory files (memory/YYYY-MM-DD.md) are disabled. Use the memory_append tool instead. If there are issues with this tool, escalate to the user rather than risk accidental modification of memory.",
+        };
+      }
+      return;
     });
   },
 };
