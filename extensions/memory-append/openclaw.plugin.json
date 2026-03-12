@@ -1,7 +1,7 @@
 {
   "id": "memory-append",
   "name": "Memory Append",
-  "description": "Append structured entries into daily memory Markdown files (memory/YYYY-MM-DD.md). Delegates to the Go binary for locking and formatting.",
+  "description": "Append structured entries into daily memory Markdown files (memory/YYYY-MM-DD.md) and inject a Recent memories hint from today's file into prompts. Delegates to the Go binary for locking and formatting.",
   "version": "0.0.1",
   "entry": "./index.ts",
   "kind": "plugin",
@@ -19,7 +19,7 @@
       },
       "registryEnvFile": {
         "type": "string",
-        "description": "Path to .env file containing the registryToken key. Defaults to '.env' in the workspace root."
+        "description": "Path to .env file containing the registryToken key. If unset, the binary reads secrets from the OS environment only."
       },
       "binaryPath": {
         "type": "string",
@@ -28,6 +28,18 @@
       "discordAccountId": {
         "type": "string",
         "description": "Discord bot account id for registry resolution. Defaults to ctx.agentAccountId."
+      },
+      "recentMaxLines": {
+        "type": "number",
+        "description": "Maximum number of recent memory lines to inject into prompts (default 20)."
+      },
+      "recentMaxChars": {
+        "type": "number",
+        "description": "Maximum total characters of recent memory text to inject into prompts (default 4000)."
+      },
+      "recentMaxLineChars": {
+        "type": "number",
+        "description": "Per-line truncation cap for recent memory lines in the prompt (default 800)."
       }
     }
   }

@@ -1,10 +1,5 @@
 import { spawn } from "node:child_process";
-import type {
-  AnyAgentTool,
-  OpenClawConfig,
-  OpenClawPluginApi,
-  PluginLogger,
-} from "openclaw/plugin-sdk";
+import type { AnyAgentTool, OpenClawConfig, OpenClawPluginApi, PluginLogger } from "openclaw/plugin-sdk";
 import { jsonResult, readStringParam } from "openclaw/plugin-sdk";
 import {
   normalizeTags,
@@ -12,6 +7,14 @@ import {
   resolveDiscordBotToken,
   resolveDiscordChannelContextType,
 } from "./src/helpers.js";
+import {
+  buildRecentMemoriesBlock,
+  DEFAULT_RECENT_MAX_CHARS,
+  DEFAULT_RECENT_MAX_LINE_CHARS,
+  DEFAULT_RECENT_MAX_LINES,
+  type MemoryScope,
+  type RecentMemoriesConfig,
+} from "./src/recent-memories.js";
 
 // OpenClawPluginToolContext is not exported from the shipped openclaw/plugin-sdk package
 // (missing re-export in the upstream SDK). Mirror the shape locally until that is fixed.
@@ -43,10 +46,13 @@ type MemoryAppendPluginConfig = {
   registryUrl?: string;
   /** Key name in registryEnvFile (or OS env) holding the registry auth secret — never the literal value. */
   registryToken?: string;
-  /** Path to .env file that contains registryToken. Defaults to ".env" in the workspace. */
+  /** Path to .env file that contains registryToken. If unset, the binary reads secrets from the OS environment only. */
   registryEnvFile?: string;
   binaryPath?: string;
   discordAccountId?: string;
+  recentMaxLines?: number;
+  recentMaxChars?: number;
+  recentMaxLineChars?: number;
 };
 
 function isDailyMemoryPath(rawPath: string): boolean {
@@ -71,10 +77,15 @@ function extractPathsFromParams(params: Record<string, unknown>): string[] {
     }
   };
 
-  add((params as any).path);
-  add((params as any).file);
-  add((params as any).files);
-  add((params as any).paths);
+  const addFromKey = (key: "path" | "file" | "files" | "paths") => {
+    const value = params[key];
+    if (value !== undefined) add(value);
+  };
+
+  addFromKey("path");
+  addFromKey("file");
+  addFromKey("files");
+  addFromKey("paths");
 
   return paths;
 }
@@ -92,8 +103,8 @@ function extractPathsFromPatchParams(params: Record<string, unknown>): string[] 
     }
   };
 
-  const rawPatch = (params as any).patch;
-  const rawPatches = (params as any).patches;
+  const rawPatch = params["patch"];
+  const rawPatches = params["patches"];
 
   if (typeof rawPatch === "string") {
     addFromPatchString(rawPatch);
@@ -440,7 +451,7 @@ const plugin = {
   id: "memory-append",
   name: "Memory Append",
   description:
-    "Append structured entries into daily memory Markdown files (memory/YYYY-MM-DD.md) for Discord agent sessions. Tool inputs are text (required) and optional priority/threadId/channelId/dmUserId/tags. Plugin config fields below are all optional and only needed when you want to control registry or binary settings.",
+    "Append structured entries into daily memory Markdown files (memory/YYYY-MM-DD.md UTC). Tool inputs are text (required) and optional priority/threadId/channelId/dmUserId/tags.",
   configSchema: {
     type: "object",
     additionalProperties: false,
@@ -470,6 +481,21 @@ const plugin = {
         description:
           "Optional. Discord bot account id for Discord/registry lookups. Defaults to ctx.agentAccountId.",
       },
+      recentMaxLines: {
+        type: "number",
+        description:
+          "Optional. Maximum number of recent memory lines to inject into prompts (default 20).",
+      },
+      recentMaxChars: {
+        type: "number",
+        description:
+          "Optional. Maximum total characters of recent memory text to inject into prompts (default 4000).",
+      },
+      recentMaxLineChars: {
+        type: "number",
+        description:
+          "Optional. Per-line truncation cap for recent memory lines in the prompt (default 800).",
+      },
     },
   },
   register(api: OpenClawPluginApi) {
@@ -491,6 +517,57 @@ const plugin = {
         };
       }
       return;
+    });
+
+    const recentCfg: RecentMemoriesConfig = {
+      maxLines: Math.max(
+        1,
+        typeof pluginCfg.recentMaxLines === "number" && Number.isFinite(pluginCfg.recentMaxLines)
+          ? Math.floor(pluginCfg.recentMaxLines)
+          : DEFAULT_RECENT_MAX_LINES,
+      ),
+      maxChars: Math.max(
+        1,
+        typeof pluginCfg.recentMaxChars === "number" && Number.isFinite(pluginCfg.recentMaxChars)
+          ? Math.floor(pluginCfg.recentMaxChars)
+          : DEFAULT_RECENT_MAX_CHARS,
+      ),
+      maxLineChars: Math.max(
+        1,
+        typeof pluginCfg.recentMaxLineChars === "number" &&
+          Number.isFinite(pluginCfg.recentMaxLineChars)
+          ? Math.floor(pluginCfg.recentMaxLineChars)
+          : DEFAULT_RECENT_MAX_LINE_CHARS,
+      ),
+    };
+
+    api.on("before_prompt_build", async (_event, ctx) => {
+      const workspaceDir = ctx.workspaceDir?.trim();
+      if (!workspaceDir) {
+        return;
+      }
+      const sessionKey = ctx.sessionKey?.trim();
+      if (!sessionKey) {
+        return;
+      }
+      const parsed = parseSessionContext(sessionKey);
+      if (!parsed) {
+        return;
+      }
+      const scope: MemoryScope = {
+        type: parsed.type as MemoryScope["type"],
+        id: parsed.id,
+      };
+
+      const block = await buildRecentMemoriesBlock({
+        workspaceDir,
+        scope,
+        cfg: recentCfg,
+      });
+      if (!block) {
+        return;
+      }
+      return { prependContext: block };
     });
   },
 };
