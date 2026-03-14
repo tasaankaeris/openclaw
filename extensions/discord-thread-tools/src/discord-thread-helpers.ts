@@ -17,6 +17,12 @@ export type DiscordChannel = {
 export const DISCORD_CHANNEL_TYPE_DM = 1;
 export const DISCORD_CHANNEL_TYPE_GROUP_DM = 3;
 
+/** Discord thread channel types: 11 = public thread, 12 = private thread. */
+export const DISCORD_CHANNEL_TYPE_PUBLIC_THREAD = 11;
+export const DISCORD_CHANNEL_TYPE_PRIVATE_THREAD = 12;
+
+const DISCORD_THREAD_TYPES = [DISCORD_CHANNEL_TYPE_PUBLIC_THREAD, DISCORD_CHANNEL_TYPE_PRIVATE_THREAD];
+
 export function resolveDiscordBotToken(params: {
   cfg?: OpenClawConfig;
   accountId: string;
@@ -124,6 +130,45 @@ export function normalizeReactionEmoji(raw: string): string {
   return encodeURIComponent(identifier);
 }
 
+/** Default container workdir when config does not specify one. We copy the basic design from src (e.g. sandbox-paths); this should properly be part of the plugin SDK and not assumed here. */
+const DEFAULT_SANDBOX_CONTAINER_WORKDIR = "/workspace";
+
+/**
+ * Resolve the sandbox container workdir from config (agents.defaults.sandbox.docker.workdir
+ * and agent-specific agents.list[].sandbox.docker.workdir). Used so attachment path mapping
+ * respects sandbox.docker.workdir when set to something other than /workspace.
+ */
+export function resolveSandboxContainerWorkdirFromConfig(params: {
+  config?: OpenClawConfig;
+  agentId?: string;
+}): string {
+  const cfg = params.config;
+  if (!cfg?.agents) {
+    return DEFAULT_SANDBOX_CONTAINER_WORKDIR;
+  }
+  const defaultWorkdir =
+    (cfg.agents as { defaults?: { sandbox?: { docker?: { workdir?: string } } } }).defaults?.sandbox
+      ?.docker?.workdir;
+  const list = (cfg.agents as { list?: Array<{ id?: string; sandbox?: { docker?: { workdir?: string } } }> })
+    .list;
+  let workdir: string | undefined = typeof defaultWorkdir === "string" ? defaultWorkdir.trim() : undefined;
+  if (params.agentId && Array.isArray(list)) {
+    const normalizedAgentId = params.agentId.trim().toLowerCase();
+    const entry = list.find(
+      (e) => e?.id != null && String(e.id).trim().toLowerCase() === normalizedAgentId,
+    );
+    const agentWorkdir = entry?.sandbox?.docker?.workdir;
+    if (typeof agentWorkdir === "string" && agentWorkdir.trim()) {
+      workdir = agentWorkdir.trim();
+    }
+  }
+  if (!workdir) {
+    return DEFAULT_SANDBOX_CONTAINER_WORKDIR;
+  }
+  const normalized = workdir.replace(/\\/g, "/").replace(/\/+$/, "") || "/";
+  return normalized.startsWith("/") ? normalized : `/${normalized}`;
+}
+
 /** Reject data URLs and base64-looking input; attachments are path-only to avoid token bloat. */
 function rejectNonPathAttachmentInput(filePath: string): void {
   const trimmed = filePath.trim();
@@ -143,13 +188,20 @@ function rejectNonPathAttachmentInput(filePath: string): void {
 export type ValidateAttachmentPathOptions = {
   /** When set, resolve relative paths against this root (agent workspace under OpenClaw root). */
   workspaceRoot?: string;
-  /** When true, agent's workspace is mounted at /workspace; map /workspace/... to workspaceRoot. When false, workspace is at workspaceRoot and paths are relative to it. */
+  /** When true, agent's workspace is mounted at containerWorkdir; map containerWorkdir/... to workspaceRoot. When false, workspace is at workspaceRoot and paths are relative to it. */
   sandboxed?: boolean;
+  /**
+   * When sandboxed, the container path where the workspace is mounted (default /workspace).
+   * Not provided by the sandbox runtime. Callers that have config (and optional agentId) should
+   * pass the result of resolveSandboxContainerWorkdirFromConfig({ config, agentId }) so
+   * sandbox.docker.workdir is respected. Omitted when the caller does not resolve it (then /workspace is used).
+   */
+  containerWorkdir?: string;
 };
 
 /**
  * Normalize and validate path; must stay under allowed roots (or under workspaceRoot when provided).
- * Sandboxed: agent sees workspace at /workspace → map to workspaceRoot. Not sandboxed: workspace at workspaceRoot, paths relative to it.
+ * Sandboxed: agent sees workspace at containerWorkdir (default /workspace) → map to workspaceRoot. Not sandboxed: workspace at workspaceRoot, paths relative to it.
  * Returns the resolved absolute path for reading.
  */
 export function validateAttachmentFilePath(
@@ -157,13 +209,21 @@ export function validateAttachmentFilePath(
   options?: ValidateAttachmentPathOptions,
 ): string {
   rejectNonPathAttachmentInput(filePath);
-  const normalized = path.normalize(filePath.trim());
+  const normalized = path.normalize(filePath.trim()).replace(/\\/g, "/");
 
   if (options?.workspaceRoot) {
     const root = path.resolve(options.workspaceRoot);
+    const workdir =
+      (options.sandboxed && options.containerWorkdir?.trim())
+        ? options.containerWorkdir.trim().replace(/\\/g, "/").replace(/\/+$/, "") || "/"
+        : DEFAULT_SANDBOX_CONTAINER_WORKDIR;
+    const workdirPrefix = workdir.startsWith("/") ? workdir : `/${workdir}`;
+    const isUnderWorkdir =
+      normalized === workdirPrefix || (workdirPrefix !== "/" && normalized.startsWith(`${workdirPrefix}/`));
     let resolved: string;
-    if (options.sandboxed && (normalized === "/workspace" || normalized.startsWith("/workspace/"))) {
-      const suffix = normalized === "/workspace" ? "" : normalized.slice("/workspace".length).replace(/^\//, "");
+    if (options.sandboxed && isUnderWorkdir) {
+      const suffix =
+        normalized === workdirPrefix ? "" : normalized.slice(workdirPrefix.length).replace(/^\//, "");
       resolved = path.resolve(root, suffix);
     } else if (path.isAbsolute(normalized)) {
       resolved = path.resolve(normalized);
@@ -256,6 +316,12 @@ export async function postAttachmentMessage(params: {
   return data;
 }
 
+/**
+ * Ensures the channel is a Discord thread and, when configured, that it belongs to the
+ * allowed guild and parent channel list. Thread-send, thread-attach, and thread-react
+ * must target a thread only; no extra arguments—callers pass a channel id and we reject
+ * if it is not a thread (type 11 or 12).
+ */
 export async function assertThreadBelongsToAllowedParent(params: {
   token: string;
   threadId: string;
@@ -267,6 +333,13 @@ export async function assertThreadBelongsToAllowedParent(params: {
     channelId: params.threadId,
   });
 
+  if (!DISCORD_THREAD_TYPES.includes(channel.type)) {
+    throw new Error(
+      `Channel ${params.threadId} is not a thread (type ${channel.type}). ` +
+        "discord-thread-send, discord-thread-attach, and discord-thread-react accept only thread channel ids.",
+    );
+  }
+
   if (params.allowedGuildId && channel.guild_id && channel.guild_id !== params.allowedGuildId) {
     throw new Error(
       `Thread ${params.threadId} is in guild ${channel.guild_id}, not allowed guild ${params.allowedGuildId}.`,
@@ -275,13 +348,18 @@ export async function assertThreadBelongsToAllowedParent(params: {
 
   if (
     params.allowedParentChannelIds &&
-    params.allowedParentChannelIds.length > 0 &&
-    channel.parent_id &&
-    !params.allowedParentChannelIds.includes(channel.parent_id)
+    params.allowedParentChannelIds.length > 0
   ) {
-    throw new Error(
-      `Thread ${params.threadId} has parent ${channel.parent_id}, which is not in the allowed parent channel list.`,
-    );
+    if (!channel.parent_id) {
+      throw new Error(
+        `Thread ${params.threadId} has no parent_id; parent channel allowlist is configured so a parent is required.`,
+      );
+    }
+    if (!params.allowedParentChannelIds.includes(channel.parent_id)) {
+      throw new Error(
+        `Thread ${params.threadId} has parent ${channel.parent_id}, which is not in the allowed parent channel list.`,
+      );
+    }
   }
 }
 

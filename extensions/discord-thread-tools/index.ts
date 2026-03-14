@@ -53,11 +53,15 @@
  * - Tools do *not* take a `channel`/`to` parameter. All routing is by thread
  *   channel id (`threadId`) plus a constrained `parentChannel` enum for
  *   creation. This removes the need for models to remember or guess parent
-   *   channel ids and prevents accidental sends to the wrong surface.
- * - `assertThreadBelongsToAllowedParent` performs a defensive check that a
- *   given `threadId` is in the expected guild and under one of a small,
- *   hard‑coded parent channel set. If this fails, the tool throws rather than
- *   risk sending to an unexpected location.
+ *   channel ids and prevents accidental sends to the wrong surface.
+ * - `assertThreadBelongsToAllowedParent` ensures the target is a Discord thread
+ *   (channel type 11 or 12) and, when configured, that it is in the expected
+ *   guild and under an allowed parent. Thread-send/attach/react are threads-only;
+ *   no extra arguments—we reject if the given channel id is not a thread.
+ * - In non‑agent contexts (e.g. tools catalog, HTTP tool invoke), the runtime
+ *   may still pass a plugin tool context with `agentId` set to a default; it may
+ *   not correspond to an active agent session. In a typical agent + Discord run,
+ *   `ctx.agentId` is the id of the agent executing the tool (set by the runtime).
  *
  * What is *not* replicated from core `message`
  * --------------------------------------------
@@ -106,6 +110,7 @@ import {
   normalizeReactionEmoji,
   postAttachmentMessage,
   resolveDiscordBotToken,
+  resolveSandboxContainerWorkdirFromConfig,
   safeJson,
   validateAttachmentFilePath,
 } from "./src/discord-thread-helpers";
@@ -153,12 +158,24 @@ async function loadAttachmentPayload(params: {
   caption?: string;
   /** Agent workspace root (OpenClaw workspace + agent workspace name). When set, paths are resolved relative to it. */
   workspaceDir?: string;
-  /** When true, agent sees workspace at /workspace; map /workspace/... to workspaceDir. When false, paths are relative to workspaceDir. */
+  /** When true, agent sees workspace at container workdir; map that path to workspaceDir. When false, paths are relative to workspaceDir. */
   sandboxed?: boolean;
+  /**
+   * Id of the agent running the tool. Set by the runtime in plugin tool context (ctx.agentId).
+   * In a typical agent + Discord run the runtime always provides it. In non-agent contexts
+   * (e.g. tools catalog, HTTP invoke) it may be a default. When sandboxed we use it to
+   * resolve agent-specific sandbox.docker.workdir from config.
+   */
+  agentId?: string;
 }): Promise<FormData> {
+  const containerWorkdir =
+    params.sandboxed && params.cfg
+      ? resolveSandboxContainerWorkdirFromConfig({ config: params.cfg, agentId: params.agentId })
+      : undefined;
   const safePath = validateAttachmentFilePath(params.filePath, {
     workspaceRoot: params.workspaceDir,
     sandboxed: params.sandboxed,
+    containerWorkdir,
   });
   const maxBytes =
     resolveChannelMediaMaxBytes({
@@ -317,16 +334,11 @@ function createDiscordThreadSendTool(
         },
         threadId: {
           type: "string",
-          description: "Discord thread/channel ID where the message will be posted.",
+          description: "Discord thread ID where the message will be posted.",
         },
         content: {
           type: "string",
           description: "Message text to post into the thread.",
-        },
-        mentionAgentId: {
-          type: "string",
-          description:
-            "Optional numeric Discord ID to mention once as <@ID>. Do not include mentions directly in content.",
         },
         replyToMessageId: {
           type: "string",
@@ -343,15 +355,8 @@ function createDiscordThreadSendTool(
       const args = rawArgs as Record<string, unknown>;
       const accountId = readStringParam(args, "accountId", { required: true });
       const threadId = readStringParam(args, "threadId", { required: true });
-      const contentRaw = readStringParam(args, "content", { required: true });
-      const mentionAgentId = readStringParam(args, "mentionAgentId");
+      const content = readStringParam(args, "content", { required: true });
       const replyToMessageId = readStringParam(args, "replyToMessageId");
-
-      if (contentRaw.includes("<@") && !mentionAgentId) {
-        throw new Error(
-          "Do not include raw Discord mentions in content; use mentionAgentId instead.",
-        );
-      }
 
       const token = resolveDiscordBotToken({ cfg, accountId });
 
@@ -363,11 +368,6 @@ function createDiscordThreadSendTool(
         allowedGuildId: guildId,
         allowedParentChannelIds: Object.values(parentChannels),
       });
-
-      let content = contentRaw;
-      if (mentionAgentId && !content.includes("<@")) {
-        content = `${content} <@${mentionAgentId}>`;
-      }
 
       const body: Record<string, unknown> = {
         content,
@@ -406,7 +406,7 @@ function createDiscordThreadSendTool(
       return jsonResult({
         ok: true,
         threadId,
-        id: message.id,
+        messageId: message.id,
       });
     },
   };
@@ -430,7 +430,7 @@ function createDiscordThreadReactTool(
         },
         threadId: {
           type: "string",
-          description: "Discord thread/channel ID where the message lives.",
+          description: "Discord thread ID where the message lives.",
         },
         messageId: {
           type: "string",
@@ -499,11 +499,11 @@ function createDiscordThreadAttachTool(
         accountId: {
           type: "string",
           description:
-            "Discord account id to send from (e.g. data, kaylee). This is required.",
+            "Discord account id to send from (e.g. kaylee, nexus). This is required.",
         },
         threadId: {
           type: "string",
-          description: "Discord thread/channel ID to post in.",
+          description: "Discord thread ID to post in.",
         },
         filePath: {
           type: "string",
@@ -551,13 +551,14 @@ function createDiscordThreadAttachTool(
         caption,
         workspaceDir: ctx.workspaceDir,
         sandboxed: ctx.sandboxed,
+        agentId: ctx.agentId, // runtime sets this to the agent that is running the tool
       });
       const result = await postAttachmentMessage({ token, channelId: threadId, form });
       ctx.logger?.debug?.("discord-thread-attach", { threadId, messageId: result.id });
       return jsonResult({
         ok: true,
         threadId,
-        id: result.id,
+        messageId: result.id,
       });
     },
   };
@@ -585,6 +586,11 @@ function createDiscordDmSendTool(ctx: OpenClawPluginToolContext): AnyAgentTool {
           type: "string",
           description: "Message text to send in the DM.",
         },
+        replyToMessageId: {
+          type: "string",
+          description:
+            "Optional message id in the DM channel to reply to using Discord's reply mechanics.",
+        },
       },
       required: ["accountId", "userId", "content"],
       additionalProperties: false,
@@ -596,6 +602,7 @@ function createDiscordDmSendTool(ctx: OpenClawPluginToolContext): AnyAgentTool {
       const accountId = readStringParam(args, "accountId", { required: true });
       const userId = readStringParam(args, "userId", { required: true });
       const content = readStringParam(args, "content", { required: true });
+      const replyToMessageId = readStringParam(args, "replyToMessageId");
 
       const token = resolveDiscordBotToken({ cfg, accountId });
 
@@ -623,6 +630,16 @@ function createDiscordDmSendTool(ctx: OpenClawPluginToolContext): AnyAgentTool {
       }
       const channelId = dmChannel.id;
 
+      const body: Record<string, unknown> = {
+        content,
+        allowed_mentions: { parse: ["users"], replied_user: false },
+      };
+      if (replyToMessageId) {
+        body.message_reference = {
+          message_id: replyToMessageId,
+        };
+      }
+
       const sendRes = await discordFetch(
         token,
         `${DISCORD_API_BASE}/channels/${channelId}/messages`,
@@ -631,10 +648,7 @@ function createDiscordDmSendTool(ctx: OpenClawPluginToolContext): AnyAgentTool {
           headers: {
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({
-            content,
-            allowed_mentions: { parse: ["users"], replied_user: false },
-          }),
+          body: JSON.stringify(body),
         },
       );
       if (!sendRes.ok) {
@@ -652,7 +666,7 @@ function createDiscordDmSendTool(ctx: OpenClawPluginToolContext): AnyAgentTool {
         ok: true,
         channelId,
         userId,
-        id: message.id,
+        messageId: message.id,
       });
     },
   };
@@ -806,7 +820,7 @@ function createDiscordDmAttachTool(ctx: OpenClawPluginToolContext): AnyAgentTool
         accountId: {
           type: "string",
           description:
-            "Discord account id to send from (e.g. data, kaylee). This is required.",
+            "Discord account id to send from (e.g. kaylee, nexus). This is required.",
         },
         channelId: {
           type: "string",
@@ -853,13 +867,14 @@ function createDiscordDmAttachTool(ctx: OpenClawPluginToolContext): AnyAgentTool
         caption,
         workspaceDir: ctx.workspaceDir,
         sandboxed: ctx.sandboxed,
+        agentId: ctx.agentId, // runtime sets this to the agent that is running the tool
       });
       const result = await postAttachmentMessage({ token, channelId, form });
       ctx.logger?.debug?.("discord-dm-attach", { channelId, messageId: result.id });
       return jsonResult({
         ok: true,
         channelId,
-        id: result.id,
+        messageId: result.id,
       });
     },
   };

@@ -5,6 +5,7 @@ import {
   assertThreadBelongsToAllowedParent,
   normalizeReactionEmoji,
   resolveDiscordBotToken,
+  resolveSandboxContainerWorkdirFromConfig,
   validateAttachmentFilePath,
 } from "./discord-thread-helpers";
 
@@ -142,6 +143,27 @@ describe("assertThreadBelongsToAllowedParent", () => {
         allowedParentChannelIds: ["parent-1"],
       }),
     ).rejects.toThrowError(/which is not in the allowed parent channel list/);
+  });
+
+  it("throws when channel is not a thread (e.g. text channel type 0)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        id: "chan-1",
+        type: 0,
+        guild_id: "guild-1",
+        parent_id: null,
+      }),
+    });
+    // @ts-expect-error override global fetch for test
+    global.fetch = fetchMock;
+
+    await expect(
+      assertThreadBelongsToAllowedParent({
+        token: "t",
+        threadId: "chan-1",
+      }),
+    ).rejects.toThrowError(/is not a thread.*type 0/);
   });
 });
 
@@ -344,6 +366,102 @@ describe("validateAttachmentFilePath", () => {
         sandboxed: false,
       });
       expect(resolved).toBe(abs);
+    });
+  });
+
+  describe("resolveSandboxContainerWorkdirFromConfig", () => {
+    it("returns /workspace when config is undefined", () => {
+      expect(resolveSandboxContainerWorkdirFromConfig({})).toBe("/workspace");
+    });
+
+    it("returns /workspace when agents is missing", () => {
+      expect(resolveSandboxContainerWorkdirFromConfig({ config: {} as OpenClawConfig })).toBe(
+        "/workspace",
+      );
+    });
+
+    it("returns default workdir from agents.defaults.sandbox.docker.workdir", () => {
+      const cfg = {
+        agents: {
+          defaults: { sandbox: { docker: { workdir: "/app" } } },
+        },
+      } as unknown as OpenClawConfig;
+      expect(resolveSandboxContainerWorkdirFromConfig({ config: cfg })).toBe("/app");
+    });
+
+    it("returns agent-specific workdir when agentId matches list entry", () => {
+      const cfg = {
+        agents: {
+          defaults: { sandbox: { docker: { workdir: "/workspace" } } },
+          list: [
+            { id: "main", sandbox: { docker: { workdir: "/work" } } },
+            { id: "other", sandbox: { docker: { workdir: "/other" } } },
+          ],
+        },
+      } as unknown as OpenClawConfig;
+      expect(resolveSandboxContainerWorkdirFromConfig({ config: cfg, agentId: "main" })).toBe("/work");
+      expect(resolveSandboxContainerWorkdirFromConfig({ config: cfg, agentId: "other" })).toBe(
+        "/other",
+      );
+    });
+
+    it("falls back to default when agentId has no override", () => {
+      const cfg = {
+        agents: {
+          defaults: { sandbox: { docker: { workdir: "/default" } } },
+          list: [{ id: "main" }],
+        },
+      } as unknown as OpenClawConfig;
+      expect(resolveSandboxContainerWorkdirFromConfig({ config: cfg, agentId: "main" })).toBe(
+        "/default",
+      );
+    });
+
+    it("matches agent by normalized id (case-insensitive, trim)", () => {
+      const cfg = {
+        agents: {
+          defaults: { sandbox: { docker: { workdir: "/default" } } },
+          list: [{ id: "Main", sandbox: { docker: { workdir: "/work" } } }],
+        },
+      } as unknown as OpenClawConfig;
+      expect(resolveSandboxContainerWorkdirFromConfig({ config: cfg, agentId: "main" })).toBe(
+        "/work",
+      );
+      expect(resolveSandboxContainerWorkdirFromConfig({ config: cfg, agentId: "  Main  " })).toBe(
+        "/work",
+      );
+    });
+  });
+
+  describe("validateAttachmentFilePath with custom containerWorkdir (sandbox.docker.workdir)", () => {
+    const workspaceRoot = path.join(path.sep, "root", "agent-workspace");
+
+    it("maps container workdir path to workspaceRoot when containerWorkdir is set", () => {
+      const resolved = validateAttachmentFilePath("/work/tmp/file.png", {
+        workspaceRoot,
+        sandboxed: true,
+        containerWorkdir: "/work",
+      });
+      expect(resolved).toBe(path.resolve(workspaceRoot, "tmp", "file.png"));
+    });
+
+    it("does not map /workspace/... when containerWorkdir is /work", () => {
+      expect(() =>
+        validateAttachmentFilePath("/workspace/tmp/file.png", {
+          workspaceRoot,
+          sandboxed: true,
+          containerWorkdir: "/work",
+        }),
+      ).toThrow(/must stay inside the workspace/);
+    });
+
+    it("maps exact container workdir to workspaceRoot", () => {
+      const resolved = validateAttachmentFilePath("/work", {
+        workspaceRoot,
+        sandboxed: true,
+        containerWorkdir: "/work",
+      });
+      expect(resolved).toBe(path.resolve(workspaceRoot));
     });
   });
 });
