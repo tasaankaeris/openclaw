@@ -417,7 +417,7 @@ export function createDiscordThreadReadTool(
         },
         contentMaxChars: {
           type: "integer",
-          description: "Maximum content characters per message (0-4000, default 400).",
+          description: "Maximum content characters per message (0-4000, default 2000).",
         },
         includeSystem: {
           type: "boolean",
@@ -452,7 +452,7 @@ export function createDiscordThreadReadTool(
       const aroundMessageId = readStringParam(args, "aroundMessageId");
       const limit = readOptionalIntegerParam(args, "limit");
       const includeContent = readBooleanParam(args, "includeContent") ?? true;
-      const contentMaxChars = readOptionalIntegerParam(args, "contentMaxChars") ?? 400;
+      const contentMaxChars = readOptionalIntegerParam(args, "contentMaxChars") ?? 2000;
       const includeSystem = readBooleanParam(args, "includeSystem") ?? false;
       const includeEmbeds = readBooleanParam(args, "includeEmbeds") ?? false;
       const includeAttachments = readBooleanParam(args, "includeAttachments") ?? false;
