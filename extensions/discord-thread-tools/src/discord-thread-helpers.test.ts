@@ -1,8 +1,12 @@
+import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "openclaw/plugin-sdk";
 import {
   assertThreadBelongsToAllowedParent,
+  discordFetch,
   encodeThreadReadCursor,
   normalizeReactionEmoji,
   readThreadMessages,
@@ -74,6 +78,59 @@ describe("resolveDiscordBotToken", () => {
     expect(() => resolveDiscordBotToken({ cfg, accountId: "missingToken" })).toThrowError(
       /is not enabled or missing token/,
     );
+  });
+});
+
+describe("discordFetch", () => {
+  it("retries on 503 with Retry-After and succeeds", async () => {
+    let calls = 0;
+    const fetchMock = vi.fn().mockImplementation(() => {
+      calls += 1;
+      if (calls === 1) {
+        return Promise.resolve({
+          ok: false,
+          status: 503,
+          headers: { get: () => "0" },
+          text: async () => "service unavailable",
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        json: async () => ({ ok: true }),
+      });
+    });
+    // @ts-expect-error override global fetch for test
+    global.fetch = fetchMock;
+
+    const res = await discordFetch("bot-token", "https://discord.com/api/v10/channels/x", {
+      method: "GET",
+    });
+    expect(res.ok).toBe(true);
+    expect(calls).toBe(2);
+  });
+
+  it("does not retry non-idempotent POST on 503", async () => {
+    let calls = 0;
+    const fetchMock = vi.fn().mockImplementation(() => {
+      calls += 1;
+      return Promise.resolve({
+        ok: false,
+        status: 503,
+        headers: { get: () => "0" },
+        text: async () => "service unavailable",
+      });
+    });
+    // @ts-expect-error override global fetch for test
+    global.fetch = fetchMock;
+
+    const res = await discordFetch("bot-token", "https://discord.com/api/v10/channels/x/messages", {
+      method: "POST",
+      body: JSON.stringify({ content: "hello" }),
+    });
+    expect(res.status).toBe(503);
+    expect(calls).toBe(1);
   });
 });
 
@@ -469,6 +526,35 @@ describe("validateAttachmentFilePath", () => {
 });
 
 describe("readThreadMessages", () => {
+  function createMockResponse(params: {
+    ok: boolean;
+    status?: number;
+    json?: unknown;
+    text?: string;
+    bytes?: Buffer;
+    headers?: Record<string, string>;
+  }) {
+    return {
+      ok: params.ok,
+      status: params.status ?? (params.ok ? 200 : 500),
+      headers: {
+        get: (name: string) => {
+          const key = Object.keys(params.headers ?? {}).find(
+            (candidate) => candidate.toLowerCase() === name.toLowerCase(),
+          );
+          return key ? (params.headers?.[key] ?? null) : null;
+        },
+      },
+      json: async () => params.json,
+      text: async () => params.text ?? "",
+      arrayBuffer: async () => {
+        const bytes = params.bytes ?? Buffer.from("");
+        const view = new Uint8Array(bytes);
+        return view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
+      },
+    };
+  }
+
   function installThreadFetchMock(messages: Array<Record<string, unknown>>) {
     const fetchMock = vi.fn().mockImplementation((url: string) => {
       if (url.includes("/messages?")) {
@@ -490,6 +576,10 @@ describe("readThreadMessages", () => {
     // @ts-expect-error override global fetch for test
     global.fetch = fetchMock;
     return fetchMock;
+  }
+
+  async function createTempWorkspaceDir(): Promise<string> {
+    return await fs.mkdtemp(path.join(os.tmpdir(), "discord-thread-tools-"));
   }
 
   it("returns neutral navigation actions and earlier cursor for latest-window reads", async () => {
@@ -668,6 +758,43 @@ describe("readThreadMessages", () => {
       },
     });
     expect(result.nextActions?.readEarlierRequest?.limit).toBe(17);
+  });
+
+  it("uses hydration default limit 5 when includeAttachments=true and limit omitted", async () => {
+    installThreadFetchMock([
+      {
+        id: "900000000000000210",
+        type: 0,
+        author: { id: "u210", username: "two-ten" },
+        content: "two-ten",
+        timestamp: "2026-03-01T00:02:10.000Z",
+        attachments: [{ id: "att-210", filename: "a.txt", url: "https://cdn.example/a.txt" }],
+      },
+    ]);
+    const cursor = encodeThreadReadCursor({
+      v: 1,
+      threadId: "thread-1",
+      dir: "earlier",
+      anchorFirstMessageId: "900000000000000211",
+      anchorLastMessageId: "900000000000000212",
+      limit: 17,
+    });
+    const result = await readThreadMessages({
+      token: "bot-token",
+      allowedGuildId: "guild-1",
+      allowedParentChannelIds: ["parent-1"],
+      read: {
+        accountId: "default",
+        threadId: "thread-1",
+        cursor,
+        includeContent: true,
+        contentMaxChars: 400,
+        includeSystem: false,
+        includeEmbeds: false,
+        includeAttachments: true,
+      },
+    });
+    expect(result.nextActions?.readEarlierRequest?.limit).toBe(5);
   });
 
   it("preserves opposite-direction cursor on zero-result continuation", async () => {
@@ -893,6 +1020,677 @@ describe("readThreadMessages", () => {
       description: "desc",
       url: "https://example.com",
     });
+  });
+
+  it("enforces limit <= 5 when includeAttachments is true", async () => {
+    let messageFetchCount = 0;
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url.includes("/messages?")) {
+        messageFetchCount += 1;
+        return Promise.resolve(createMockResponse({ ok: true, json: [] }));
+      }
+      return Promise.resolve(
+        createMockResponse({
+          ok: true,
+          json: { id: "thread-1", type: 11, guild_id: "guild-1", parent_id: "parent-1" },
+        }),
+      );
+    });
+    // @ts-expect-error override global fetch for test
+    global.fetch = fetchMock;
+    await expect(
+      readThreadMessages({
+        token: "bot-token",
+        allowedGuildId: "guild-1",
+        allowedParentChannelIds: ["parent-1"],
+        read: {
+          accountId: "default",
+          threadId: "thread-1",
+          limit: 6,
+          includeContent: true,
+          contentMaxChars: 400,
+          includeSystem: false,
+          includeEmbeds: false,
+          includeAttachments: true,
+          workspaceDir: "/tmp/workspace",
+          sandboxed: true,
+        },
+      }),
+    ).rejects.toThrow(/limit must be <= 5/);
+    expect(messageFetchCount).toBe(0);
+  });
+
+  it("hydrates a specific aroundMessageId attachment with sandbox-usable localPath", async () => {
+    const workspaceDir = await createTempWorkspaceDir();
+    try {
+      const attachmentUrl = "https://cdn.example/specific.txt";
+      const expectedHash = crypto.createHash("sha256").update(attachmentUrl, "utf8").digest("hex");
+      const fetchMock = vi.fn().mockImplementation((url: string) => {
+        if (url.includes("/messages?")) {
+          return Promise.resolve(
+            createMockResponse({
+              ok: true,
+              json: [
+                {
+                  id: "900000000000000081",
+                  type: 0,
+                  author: { id: "u81", username: "eighty-one" },
+                  content: "target",
+                  timestamp: "2026-03-01T00:00:81.000Z",
+                  attachments: [
+                    {
+                      id: "att-81",
+                      filename: "specific.txt",
+                      content_type: "text/plain",
+                      url: attachmentUrl,
+                    },
+                  ],
+                },
+              ],
+            }),
+          );
+        }
+        if (url === attachmentUrl) {
+          return Promise.resolve(createMockResponse({ ok: true, bytes: Buffer.from("payload-81") }));
+        }
+        return Promise.resolve(
+          createMockResponse({
+            ok: true,
+            json: { id: "thread-1", type: 11, guild_id: "guild-1", parent_id: "parent-1" },
+          }),
+        );
+      });
+      // @ts-expect-error override global fetch for test
+      global.fetch = fetchMock;
+
+      const result = await readThreadMessages({
+        token: "bot-token",
+        allowedGuildId: "guild-1",
+        allowedParentChannelIds: ["parent-1"],
+        read: {
+          accountId: "default",
+          threadId: "thread-1",
+          aroundMessageId: "900000000000000081",
+          limit: 1,
+          includeContent: true,
+          contentMaxChars: 400,
+          includeSystem: false,
+          includeEmbeds: false,
+          includeAttachments: true,
+          workspaceDir,
+          sandboxed: true,
+        },
+      });
+
+      expect(result.messages[0]?.attachments?.[0]?.localPath).toBe(`media/inbound/${expectedHash}`);
+      expect(result.messages[0]?.attachments?.[0]?.hydrationFailure).toBeUndefined();
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reuses deterministic hydrated attachment unless forceReDownload is true", async () => {
+    const workspaceDir = await createTempWorkspaceDir();
+    try {
+      const attachmentUrl = "https://cdn.example/reuse.txt";
+      let attachmentFetchCount = 0;
+      const fetchMock = vi.fn().mockImplementation((url: string) => {
+        if (url.includes("/messages?")) {
+          return Promise.resolve(
+            createMockResponse({
+              ok: true,
+              json: [
+                {
+                  id: "900000000000000082",
+                  type: 0,
+                  author: { id: "u82", username: "eighty-two" },
+                  content: "reuse",
+                  timestamp: "2026-03-01T00:00:82.000Z",
+                  attachments: [{ id: "att-82", filename: "reuse.txt", url: attachmentUrl }],
+                },
+              ],
+            }),
+          );
+        }
+        if (url === attachmentUrl) {
+          attachmentFetchCount += 1;
+          return Promise.resolve(createMockResponse({ ok: true, bytes: Buffer.from("payload-reuse") }));
+        }
+        return Promise.resolve(
+          createMockResponse({
+            ok: true,
+            json: { id: "thread-1", type: 11, guild_id: "guild-1", parent_id: "parent-1" },
+          }),
+        );
+      });
+      // @ts-expect-error override global fetch for test
+      global.fetch = fetchMock;
+
+      await readThreadMessages({
+        token: "bot-token",
+        allowedGuildId: "guild-1",
+        allowedParentChannelIds: ["parent-1"],
+        read: {
+          accountId: "default",
+          threadId: "thread-1",
+          limit: 1,
+          includeContent: true,
+          contentMaxChars: 400,
+          includeSystem: false,
+          includeEmbeds: false,
+          includeAttachments: true,
+          workspaceDir,
+          sandboxed: true,
+          forceReDownload: false,
+        },
+      });
+      await readThreadMessages({
+        token: "bot-token",
+        allowedGuildId: "guild-1",
+        allowedParentChannelIds: ["parent-1"],
+        read: {
+          accountId: "default",
+          threadId: "thread-1",
+          limit: 1,
+          includeContent: true,
+          contentMaxChars: 400,
+          includeSystem: false,
+          includeEmbeds: false,
+          includeAttachments: true,
+          workspaceDir,
+          sandboxed: true,
+          forceReDownload: false,
+        },
+      });
+      expect(attachmentFetchCount).toBe(1);
+
+      await readThreadMessages({
+        token: "bot-token",
+        allowedGuildId: "guild-1",
+        allowedParentChannelIds: ["parent-1"],
+        read: {
+          accountId: "default",
+          threadId: "thread-1",
+          limit: 1,
+          includeContent: true,
+          contentMaxChars: 400,
+          includeSystem: false,
+          includeEmbeds: false,
+          includeAttachments: true,
+          workspaceDir,
+          sandboxed: true,
+          forceReDownload: true,
+        },
+      });
+      expect(attachmentFetchCount).toBe(2);
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("canonicalizes URL cache key by ignoring query params", async () => {
+    const workspaceDir = await createTempWorkspaceDir();
+    try {
+      const firstUrl = "https://cdn.example/cached.txt?ex=111&sig=aaa";
+      const secondUrl = "https://cdn.example/cached.txt?ex=222&sig=bbb";
+      let attachmentFetchCount = 0;
+      const fetchMock = vi.fn().mockImplementation((url: string) => {
+        if (url.includes("/messages?")) {
+          const attachmentUrl = attachmentFetchCount === 0 ? firstUrl : secondUrl;
+          return Promise.resolve(
+            createMockResponse({
+              ok: true,
+              json: [
+                {
+                  id: "900000000000000182",
+                  type: 0,
+                  author: { id: "u182", username: "u182" },
+                  content: "cached",
+                  timestamp: "2026-03-01T00:01:82.000Z",
+                  attachments: [{ id: "att-182", filename: "cached.txt", url: attachmentUrl }],
+                },
+              ],
+            }),
+          );
+        }
+        if (url === firstUrl || url === secondUrl) {
+          attachmentFetchCount += 1;
+          return Promise.resolve(createMockResponse({ ok: true, bytes: Buffer.from("payload-cached") }));
+        }
+        return Promise.resolve(
+          createMockResponse({
+            ok: true,
+            json: { id: "thread-1", type: 11, guild_id: "guild-1", parent_id: "parent-1" },
+          }),
+        );
+      });
+      // @ts-expect-error override global fetch for test
+      global.fetch = fetchMock;
+
+      await readThreadMessages({
+        token: "bot-token",
+        allowedGuildId: "guild-1",
+        allowedParentChannelIds: ["parent-1"],
+        read: {
+          accountId: "default",
+          threadId: "thread-1",
+          limit: 1,
+          includeContent: true,
+          contentMaxChars: 400,
+          includeSystem: false,
+          includeEmbeds: false,
+          includeAttachments: true,
+          workspaceDir,
+          sandboxed: true,
+        },
+      });
+      await readThreadMessages({
+        token: "bot-token",
+        allowedGuildId: "guild-1",
+        allowedParentChannelIds: ["parent-1"],
+        read: {
+          accountId: "default",
+          threadId: "thread-1",
+          limit: 1,
+          includeContent: true,
+          contentMaxChars: 400,
+          includeSystem: false,
+          includeEmbeds: false,
+          includeAttachments: true,
+          workspaceDir,
+          sandboxed: true,
+        },
+      });
+      expect(attachmentFetchCount).toBe(1);
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not reuse zero-byte cached hydration file", async () => {
+    const workspaceDir = await createTempWorkspaceDir();
+    try {
+      const attachmentUrl = "https://cdn.example/zero-byte.txt?sig=xyz";
+      const canonicalUrl = "https://cdn.example/zero-byte.txt";
+      const hash = crypto.createHash("sha256").update(canonicalUrl, "utf8").digest("hex");
+      const cachePath = path.join(workspaceDir, "media", "inbound", hash);
+      await fs.mkdir(path.dirname(cachePath), { recursive: true });
+      await fs.writeFile(cachePath, Buffer.alloc(0));
+
+      let attachmentFetchCount = 0;
+      const fetchMock = vi.fn().mockImplementation((url: string) => {
+        if (url.includes("/messages?")) {
+          return Promise.resolve(
+            createMockResponse({
+              ok: true,
+              json: [
+                {
+                  id: "900000000000000184",
+                  type: 0,
+                  author: { id: "u184", username: "u184" },
+                  content: "zero cache",
+                  timestamp: "2026-03-01T00:01:84.000Z",
+                  attachments: [{ id: "att-184", filename: "zero-byte.txt", url: attachmentUrl }],
+                },
+              ],
+            }),
+          );
+        }
+        if (url === attachmentUrl) {
+          attachmentFetchCount += 1;
+          return Promise.resolve(createMockResponse({ ok: true, bytes: Buffer.from("fresh-payload") }));
+        }
+        return Promise.resolve(
+          createMockResponse({
+            ok: true,
+            json: { id: "thread-1", type: 11, guild_id: "guild-1", parent_id: "parent-1" },
+          }),
+        );
+      });
+      // @ts-expect-error override global fetch for test
+      global.fetch = fetchMock;
+
+      const result = await readThreadMessages({
+        token: "bot-token",
+        allowedGuildId: "guild-1",
+        allowedParentChannelIds: ["parent-1"],
+        read: {
+          accountId: "default",
+          threadId: "thread-1",
+          limit: 1,
+          includeContent: true,
+          contentMaxChars: 400,
+          includeSystem: false,
+          includeEmbeds: false,
+          includeAttachments: true,
+          workspaceDir,
+          sandboxed: true,
+        },
+      });
+      expect(attachmentFetchCount).toBe(1);
+      expect(result.messages[0]?.attachments?.[0]?.localPath).toBe(`media/inbound/${hash}`);
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not reuse cached file when attachment size mismatches", async () => {
+    const workspaceDir = await createTempWorkspaceDir();
+    try {
+      const attachmentUrl = "https://cdn.example/size-check.txt";
+      const canonicalUrl = "https://cdn.example/size-check.txt";
+      const hash = crypto.createHash("sha256").update(canonicalUrl, "utf8").digest("hex");
+      const cachePath = path.join(workspaceDir, "media", "inbound", hash);
+      await fs.mkdir(path.dirname(cachePath), { recursive: true });
+      await fs.writeFile(cachePath, Buffer.from("short"));
+
+      let attachmentFetchCount = 0;
+      const fetchMock = vi.fn().mockImplementation((url: string) => {
+        if (url.includes("/messages?")) {
+          return Promise.resolve(
+            createMockResponse({
+              ok: true,
+              json: [
+                {
+                  id: "900000000000000185",
+                  type: 0,
+                  author: { id: "u185", username: "u185" },
+                  content: "size mismatch",
+                  timestamp: "2026-03-01T00:01:85.000Z",
+                  attachments: [
+                    { id: "att-185", filename: "size-check.txt", url: attachmentUrl, size: 999 },
+                  ],
+                },
+              ],
+            }),
+          );
+        }
+        if (url === attachmentUrl) {
+          attachmentFetchCount += 1;
+          return Promise.resolve(createMockResponse({ ok: true, bytes: Buffer.from("fresh-size-payload") }));
+        }
+        return Promise.resolve(
+          createMockResponse({
+            ok: true,
+            json: { id: "thread-1", type: 11, guild_id: "guild-1", parent_id: "parent-1" },
+          }),
+        );
+      });
+      // @ts-expect-error override global fetch for test
+      global.fetch = fetchMock;
+
+      await readThreadMessages({
+        token: "bot-token",
+        allowedGuildId: "guild-1",
+        allowedParentChannelIds: ["parent-1"],
+        read: {
+          accountId: "default",
+          threadId: "thread-1",
+          limit: 1,
+          includeContent: true,
+          contentMaxChars: 400,
+          includeSystem: false,
+          includeEmbeds: false,
+          includeAttachments: true,
+          workspaceDir,
+          sandboxed: true,
+        },
+      });
+      expect(attachmentFetchCount).toBe(1);
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns host workspace absolute localPath when not sandboxed", async () => {
+    const workspaceDir = await createTempWorkspaceDir();
+    try {
+      const attachmentUrl = "https://cdn.example/non-sandbox.txt";
+      const expectedHash = crypto.createHash("sha256").update("https://cdn.example/non-sandbox.txt", "utf8").digest("hex");
+      const fetchMock = vi.fn().mockImplementation((url: string) => {
+        if (url.includes("/messages?")) {
+          return Promise.resolve(
+            createMockResponse({
+              ok: true,
+              json: [
+                {
+                  id: "900000000000000183",
+                  type: 0,
+                  author: { id: "u183", username: "u183" },
+                  content: "non sandbox",
+                  timestamp: "2026-03-01T00:01:83.000Z",
+                  attachments: [{ id: "att-183", filename: "non-sandbox.txt", url: attachmentUrl }],
+                },
+              ],
+            }),
+          );
+        }
+        if (url === attachmentUrl) {
+          return Promise.resolve(createMockResponse({ ok: true, bytes: Buffer.from("payload") }));
+        }
+        return Promise.resolve(
+          createMockResponse({
+            ok: true,
+            json: { id: "thread-1", type: 11, guild_id: "guild-1", parent_id: "parent-1" },
+          }),
+        );
+      });
+      // @ts-expect-error override global fetch for test
+      global.fetch = fetchMock;
+      const result = await readThreadMessages({
+        token: "bot-token",
+        allowedGuildId: "guild-1",
+        allowedParentChannelIds: ["parent-1"],
+        read: {
+          accountId: "default",
+          threadId: "thread-1",
+          limit: 1,
+          includeContent: true,
+          contentMaxChars: 400,
+          includeSystem: false,
+          includeEmbeds: false,
+          includeAttachments: true,
+          workspaceDir,
+          sandboxed: false,
+        },
+      });
+      expect(result.messages[0]?.attachments?.[0]?.localPath).toBe(
+        path.join(workspaceDir, "media", "inbound", expectedHash),
+      );
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("retries on 503 Retry-After and transient network errors during hydration", async () => {
+    const workspaceDir = await createTempWorkspaceDir();
+    try {
+      const attachmentUrl = "https://cdn.example/retry.txt";
+      let attachmentAttempts = 0;
+      const fetchMock = vi.fn().mockImplementation((url: string) => {
+        if (url.includes("/messages?")) {
+          return Promise.resolve(
+            createMockResponse({
+              ok: true,
+              json: [
+                {
+                  id: "900000000000000083",
+                  type: 0,
+                  author: { id: "u83", username: "eighty-three" },
+                  content: "retry",
+                  timestamp: "2026-03-01T00:00:83.000Z",
+                  attachments: [{ id: "att-83", filename: "retry.txt", url: attachmentUrl }],
+                },
+              ],
+            }),
+          );
+        }
+        if (url === attachmentUrl) {
+          attachmentAttempts += 1;
+          if (attachmentAttempts === 1) {
+            return Promise.resolve(
+              createMockResponse({
+                ok: false,
+                status: 503,
+                headers: { "Retry-After": "0" },
+                text: "unavailable",
+              }),
+            );
+          }
+          if (attachmentAttempts === 2) {
+            const err = new Error("socket timeout") as Error & { code?: string };
+            err.code = "ETIMEDOUT";
+            return Promise.reject(err);
+          }
+          return Promise.resolve(createMockResponse({ ok: true, bytes: Buffer.from("payload-retry") }));
+        }
+        return Promise.resolve(
+          createMockResponse({
+            ok: true,
+            json: { id: "thread-1", type: 11, guild_id: "guild-1", parent_id: "parent-1" },
+          }),
+        );
+      });
+      // @ts-expect-error override global fetch for test
+      global.fetch = fetchMock;
+
+      const result = await readThreadMessages({
+        token: "bot-token",
+        allowedGuildId: "guild-1",
+        allowedParentChannelIds: ["parent-1"],
+        read: {
+          accountId: "default",
+          threadId: "thread-1",
+          limit: 1,
+          includeContent: true,
+          contentMaxChars: 400,
+          includeSystem: false,
+          includeEmbeds: false,
+          includeAttachments: true,
+          workspaceDir,
+          sandboxed: true,
+        },
+      });
+      expect(result.messages[0]?.attachments?.[0]?.localPath).toMatch(/^media\/inbound\/[a-f0-9]{64}$/);
+      expect(attachmentAttempts).toBe(3);
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("marks attachment hydrationFailure and logs details on non-retryable failures", async () => {
+    const workspaceDir = await createTempWorkspaceDir();
+    try {
+      const attachmentUrl = "https://cdn.example/not-found.txt";
+      const logger = { warn: vi.fn() };
+      const fetchMock = vi.fn().mockImplementation((url: string) => {
+        if (url.includes("/messages?")) {
+          return Promise.resolve(
+            createMockResponse({
+              ok: true,
+              json: [
+                {
+                  id: "900000000000000084",
+                  type: 0,
+                  author: { id: "u84", username: "eighty-four" },
+                  content: "missing",
+                  timestamp: "2026-03-01T00:00:84.000Z",
+                  attachments: [{ id: "att-84", filename: "missing.txt", url: attachmentUrl }],
+                },
+              ],
+            }),
+          );
+        }
+        if (url === attachmentUrl) {
+          return Promise.resolve(createMockResponse({ ok: false, status: 404, text: "not found" }));
+        }
+        return Promise.resolve(
+          createMockResponse({
+            ok: true,
+            json: { id: "thread-1", type: 11, guild_id: "guild-1", parent_id: "parent-1" },
+          }),
+        );
+      });
+      // @ts-expect-error override global fetch for test
+      global.fetch = fetchMock;
+
+      const result = await readThreadMessages({
+        token: "bot-token",
+        allowedGuildId: "guild-1",
+        allowedParentChannelIds: ["parent-1"],
+        logger,
+        read: {
+          accountId: "default",
+          threadId: "thread-1",
+          limit: 1,
+          includeContent: true,
+          contentMaxChars: 400,
+          includeSystem: false,
+          includeEmbeds: false,
+          includeAttachments: true,
+          workspaceDir,
+          sandboxed: true,
+        },
+      });
+      expect(result.messages[0]?.attachments?.[0]?.localPath).toBeUndefined();
+      expect(result.messages[0]?.attachments?.[0]?.hydrationFailure).toBe(true);
+      expect(logger.warn).toHaveBeenCalled();
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("marks hydrationFailure when workspaceDir is missing", async () => {
+    const attachmentUrl = "https://cdn.example/no-workspace.txt";
+    const logger = { warn: vi.fn() };
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url.includes("/messages?")) {
+        return Promise.resolve(
+          createMockResponse({
+            ok: true,
+            json: [
+              {
+                id: "900000000000000085",
+                type: 0,
+                author: { id: "u85", username: "eighty-five" },
+                content: "missing workspace",
+                timestamp: "2026-03-01T00:00:85.000Z",
+                attachments: [{ id: "att-85", filename: "no-workspace.txt", url: attachmentUrl }],
+              },
+            ],
+          }),
+        );
+      }
+      return Promise.resolve(
+        createMockResponse({
+          ok: true,
+          json: { id: "thread-1", type: 11, guild_id: "guild-1", parent_id: "parent-1" },
+        }),
+      );
+    });
+    // @ts-expect-error override global fetch for test
+    global.fetch = fetchMock;
+
+    const result = await readThreadMessages({
+      token: "bot-token",
+      allowedGuildId: "guild-1",
+      allowedParentChannelIds: ["parent-1"],
+      logger,
+      read: {
+        accountId: "default",
+        threadId: "thread-1",
+        limit: 1,
+        includeContent: true,
+        contentMaxChars: 400,
+        includeSystem: false,
+        includeEmbeds: false,
+        includeAttachments: true,
+        sandboxed: true,
+      },
+    });
+    expect(result.messages[0]?.attachments?.[0]?.localPath).toBeUndefined();
+    expect(result.messages[0]?.attachments?.[0]?.hydrationFailure).toBe(true);
+    expect(logger.warn).toHaveBeenCalled();
   });
 
   it("truncates content when contentMaxChars is set", async () => {

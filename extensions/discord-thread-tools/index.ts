@@ -104,8 +104,9 @@
  * - Returned `nextActions` contain full executable request objects with
  *   explicit effective optional values so callers can replay without hidden
  *   defaults.
- * - Attachment reads return metadata plus URLs only (no inline blobs), and
- *   attachment follow-up behavior is capability-based rather than auto-guided.
+ * - Attachment reads are opt-in via `includeAttachments`. When enabled, the
+ *   tool returns metadata plus hydration attempts to local `media/inbound/*`
+ *   paths (with per-attachment failure flags instead of verbose errors).
  * - `includeSystem=false` is a presentation filter only; raw-window anchors and
  *   counters (`rawCount`, `filteredOutCount`, and optional `filtered`) remain
  *   grounded in the fetched Discord window for stable continuation behavior.
@@ -669,7 +670,13 @@ function createDiscordThreadReadTool(
         },
         includeAttachments: {
           type: "boolean",
-          description: "Include compact attachment metadata and URLs (default false).",
+          description:
+            "Include compact attachment metadata and hydrate attachments into local media/inbound paths (default false).",
+        },
+        forceReDownload: {
+          type: "boolean",
+          description:
+            "When includeAttachments=true, bypass deterministic URL-hash cache and re-download attachments (default false).",
         },
       },
       required: ["accountId", "threadId"],
@@ -690,9 +697,14 @@ function createDiscordThreadReadTool(
       const includeSystem = readBooleanParam(args, "includeSystem") ?? false;
       const includeEmbeds = readBooleanParam(args, "includeEmbeds") ?? false;
       const includeAttachments = readBooleanParam(args, "includeAttachments") ?? false;
+      const forceReDownload = readBooleanParam(args, "forceReDownload") ?? false;
+      const effectiveLimit = limit ?? (includeAttachments ? 5 : undefined);
 
       if (limit != null && (limit < 1 || limit > 100)) {
         throw new Error(`limit must be between 1 and 100 (got ${limit}).`);
+      }
+      if (includeAttachments && effectiveLimit != null && effectiveLimit > 5) {
+        throw new Error("When includeAttachments=true, limit must be <= 5.");
       }
       if (includeContent && (contentMaxChars < 0 || contentMaxChars > 4000)) {
         throw new Error(
@@ -730,7 +742,7 @@ function createDiscordThreadReadTool(
         read: {
           accountId,
           threadId,
-          limit: limit ?? undefined,
+          limit: effectiveLimit,
           cursor: cursor ?? undefined,
           direction,
           aroundMessageId: aroundMessageId ?? undefined,
@@ -739,7 +751,11 @@ function createDiscordThreadReadTool(
           includeSystem,
           includeEmbeds,
           includeAttachments,
+          forceReDownload,
+          workspaceDir: ctx.workspaceDir,
+          sandboxed: ctx.sandboxed,
         },
+        logger: ctx.logger,
       });
 
       return jsonResult(result);

@@ -11,11 +11,11 @@
  *   appear on `later` reads by design.
  * - Navigation actions returned by the tool are fully executable and include
  *   explicit effective optional values (no hidden defaults at replay time).
- * - Attachment output is metadata only (`url` / `proxyUrl` plus descriptors);
- *   no inline binary or base64 payloads are returned by read operations.
- * - Attachment handling is capability-based and metadata-driven: the tool
- *   exposes how to retrieve details but does not inject objective-specific
- *   follow-up actions.
+ * - Attachment output is opt-in via `includeAttachments`. When enabled, each
+ *   attachment includes metadata plus hydration attempts to local
+ *   `media/inbound/*` paths (per-attachment `hydrationFailure` on failure).
+ * - Attachment handling remains capability-based: callers choose when to read
+ *   around a message and hydrate attachments.
  * - System-message filtering (`includeSystem=false`) is presentation-only.
  *   Cursor anchors and boundary ids are derived from the raw fetched window.
  *   Read outputs include explicit `rawCount`, `filteredOutCount`, and optional
@@ -24,6 +24,8 @@
  *   fetch attachment details by combining `aroundMessageId` with
  *   `includeAttachments=true`.
  */
+import crypto from "node:crypto";
+import fs from "node:fs/promises";
 import path from "node:path";
 import type { OpenClawConfig } from "openclaw/plugin-sdk";
 import { resolveDiscordAccount } from "openclaw/plugin-sdk";
@@ -31,6 +33,15 @@ import { resolveDiscordAccount } from "openclaw/plugin-sdk";
 const DISCORD_API_BASE = "https://discord.com/api/v10";
 const RATE_LIMIT_MAX_RETRIES = 3;
 const RATE_LIMIT_MAX_DELAY_MS = 10_000;
+const ATTACHMENT_HYDRATION_MAX_RETRIES = 3;
+const ATTACHMENT_HYDRATION_MAX_DELAY_MS = 10_000;
+const ATTACHMENT_HYDRATION_ERROR_MAX_LEN = 120;
+const RETRYABLE_HTTP_STATUSES = new Set([429, 503, 504]);
+
+type ToolLogger = {
+  debug?: (...args: unknown[]) => void;
+  warn?: (...args: unknown[]) => void;
+};
 
 export type DiscordChannel = {
   id: string;
@@ -95,6 +106,9 @@ export type DiscordThreadReadParams = {
   includeSystem: boolean;
   includeEmbeds: boolean;
   includeAttachments: boolean;
+  forceReDownload?: boolean;
+  workspaceDir?: string;
+  sandboxed?: boolean;
 };
 
 type ProjectedAttachment = {
@@ -104,6 +118,8 @@ type ProjectedAttachment = {
   size?: number;
   url?: string;
   proxyUrl?: string;
+  localPath?: string;
+  hydrationFailure?: true;
 };
 
 type ProjectedEmbed = {
@@ -164,6 +180,7 @@ export type DiscordThreadReadResult = {
       includeEmbeds: boolean;
       includeAttachments: boolean;
       includeSystem: boolean;
+      forceReDownload: boolean;
     };
     readLaterRequest?: {
       accountId: string;
@@ -176,6 +193,7 @@ export type DiscordThreadReadResult = {
       includeEmbeds: boolean;
       includeAttachments: boolean;
       includeSystem: boolean;
+      forceReDownload: boolean;
     };
     aroundMessageTemplate: {
       accountId: string;
@@ -187,6 +205,7 @@ export type DiscordThreadReadResult = {
       includeContent: boolean;
       contentMaxChars: number;
       includeSystem: boolean;
+      forceReDownload: boolean;
     };
   };
 };
@@ -225,51 +244,142 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function parseRetryAfterMs(retryAfter: string | null, maxDelayMs: number): number | undefined {
+  if (!retryAfter) {
+    return undefined;
+  }
+  const seconds = Number.parseFloat(retryAfter);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(Math.ceil(seconds * 1000), maxDelayMs);
+  }
+  const asDate = Date.parse(retryAfter);
+  if (Number.isFinite(asDate)) {
+    const delayMs = asDate - Date.now();
+    if (delayMs > 0) {
+      return Math.min(delayMs, maxDelayMs);
+    }
+  }
+  return undefined;
+}
+
+function resolveRetryDelayMs(params: {
+  attempt: number;
+  retryAfter: string | null;
+  maxDelayMs: number;
+}): number {
+  const fromHeader = parseRetryAfterMs(params.retryAfter, params.maxDelayMs);
+  if (fromHeader != null) {
+    return fromHeader;
+  }
+  const exp = Math.min(500 * Math.pow(2, params.attempt), params.maxDelayMs);
+  return Math.max(250, Math.trunc(exp));
+}
+
+function isTransientNetworkError(err: unknown): boolean {
+  if (!(err instanceof Error)) {
+    return false;
+  }
+  const candidateCodes = [
+    (err as { code?: unknown }).code,
+    (err as { cause?: { code?: unknown } }).cause?.code,
+  ]
+    .filter((v): v is string => typeof v === "string")
+    .map((v) => v.toUpperCase());
+  const knownCodes = new Set([
+    "ECONNRESET",
+    "ECONNREFUSED",
+    "ETIMEDOUT",
+    "EAI_AGAIN",
+    "ENOTFOUND",
+    "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_HEADERS_TIMEOUT",
+    "UND_ERR_BODY_TIMEOUT",
+    "UND_ERR_SOCKET",
+    "UND_ERR_CONNECT_ERROR",
+  ]);
+  if (candidateCodes.some((code) => knownCodes.has(code))) {
+    return true;
+  }
+  return /(timed out|fetch failed|network|socket hang up|connection reset|temporary failure|dns)/i.test(
+    err.message,
+  );
+}
+
+async function fetchWithRetry(params: {
+  url: string;
+  init: RequestInit & { method: string };
+  maxRetries: number;
+  maxDelayMs: number;
+  retryableStatuses?: Set<number>;
+  retryNetworkErrors?: boolean;
+}): Promise<Response> {
+  let lastResponse: Response | undefined;
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= params.maxRetries; attempt += 1) {
+    try {
+      const res = await fetch(params.url, params.init);
+      if (!(params.retryableStatuses ?? RETRYABLE_HTTP_STATUSES).has(res.status)) {
+        return res;
+      }
+      lastResponse = res;
+      if (attempt === params.maxRetries) {
+        return res;
+      }
+      await sleep(
+        resolveRetryDelayMs({
+          attempt,
+          retryAfter: res.headers.get("Retry-After"),
+          maxDelayMs: params.maxDelayMs,
+        }),
+      );
+      continue;
+    } catch (err) {
+      lastError = err;
+      if (!params.retryNetworkErrors || !isTransientNetworkError(err) || attempt === params.maxRetries) {
+        throw err;
+      }
+      await sleep(
+        resolveRetryDelayMs({
+          attempt,
+          retryAfter: null,
+          maxDelayMs: params.maxDelayMs,
+        }),
+      );
+    }
+  }
+  if (lastResponse) {
+    return lastResponse;
+  }
+  throw new Error(
+    `request failed: ${
+      lastError instanceof Error ? lastError.message : String(lastError ?? "unknown error")
+    }`,
+  );
+}
+
 export async function discordFetch(
   token: string,
   url: string,
   init: RequestInit & { method: string },
 ): Promise<Response> {
-  let lastRes: Response | null = null;
-  for (let attempt = 0; attempt <= RATE_LIMIT_MAX_RETRIES; attempt++) {
-    const res = await fetch(url, {
+  const method = (init.method || "GET").toUpperCase();
+  const isIdempotentMethod = method === "GET" || method === "HEAD";
+  const retryableStatuses = isIdempotentMethod ? RETRYABLE_HTTP_STATUSES : new Set([429]);
+  return await fetchWithRetry({
+    url,
+    init: {
       ...init,
       headers: {
         Authorization: `Bot ${token}`,
         ...(init.headers ?? {}),
       },
-    });
-    if (res.status !== 429) {
-      return res;
-    }
-    lastRes = res;
-    if (attempt === RATE_LIMIT_MAX_RETRIES) {
-      break;
-    }
-    let delayMs = 1000;
-    try {
-      const retryAfter = res.headers.get("Retry-After");
-      if (retryAfter) {
-        const seconds = parseInt(retryAfter, 10);
-        if (Number.isFinite(seconds)) {
-          delayMs = Math.min(seconds * 1000, RATE_LIMIT_MAX_DELAY_MS);
-        }
-      } else {
-        const data = await res.json().catch(() => ({}));
-        const raw = (data as { retry_after?: number }).retry_after;
-        if (typeof raw === "number" && Number.isFinite(raw)) {
-          delayMs = Math.min(raw * 1000, RATE_LIMIT_MAX_DELAY_MS);
-        }
-      }
-    } catch {
-      // use default delayMs
-    }
-    await sleep(delayMs);
-  }
-  const body = lastRes ? await lastRes.text() : "";
-  throw new Error(
-    formatDiscordError("request", lastRes?.status ?? 429, body.slice(0, 500)),
-  );
+      method,
+    },
+    maxRetries: RATE_LIMIT_MAX_RETRIES,
+    maxDelayMs: RATE_LIMIT_MAX_DELAY_MS,
+    retryableStatuses,
+    retryNetworkErrors: isIdempotentMethod,
+  });
 }
 
 export function formatDiscordError(
@@ -626,6 +736,222 @@ function normalizeMessagesOldestToNewest(messages: DiscordRawMessage[]): Discord
   return [...messages].sort((a, b) => messageIdComparatorAsc(a.id, b.id));
 }
 
+function toHostPathFromPosixRelative(baseDir: string, relativePath: string): string {
+  return path.join(baseDir, ...relativePath.split("/"));
+}
+
+function truncateErrorSummary(message: string): string {
+  const trimmed = message.trim();
+  if (!trimmed) {
+    return "attachment hydration failed";
+  }
+  if (trimmed.length <= ATTACHMENT_HYDRATION_ERROR_MAX_LEN) {
+    return trimmed;
+  }
+  return `${trimmed.slice(0, ATTACHMENT_HYDRATION_ERROR_MAX_LEN - 3)}...`;
+}
+
+async function fetchAttachmentWithRetry(params: {
+  url: string;
+  token: string;
+}): Promise<Response> {
+  return await fetchWithRetry({
+    url: params.url,
+    init: {
+      method: "GET",
+      headers: { Authorization: `Bot ${params.token}` },
+    },
+    maxRetries: ATTACHMENT_HYDRATION_MAX_RETRIES,
+    maxDelayMs: ATTACHMENT_HYDRATION_MAX_DELAY_MS,
+    retryableStatuses: RETRYABLE_HTTP_STATUSES,
+    retryNetworkErrors: true,
+  });
+}
+
+function canonicalizeAttachmentUrl(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return rawUrl;
+  }
+}
+
+function resolveHydrationRelativePath(url: string): string {
+  const canonical = canonicalizeAttachmentUrl(url);
+  const hash = crypto.createHash("sha256").update(canonical, "utf8").digest("hex");
+  return path.posix.join("media", "inbound", hash);
+}
+
+function resolveCallerLocalPath(params: {
+  workspaceDir: string;
+  relativePath: string;
+  sandboxed?: boolean;
+}): string {
+  if (params.sandboxed) {
+    return params.relativePath;
+  }
+  return toHostPathFromPosixRelative(params.workspaceDir, params.relativePath);
+}
+
+async function existsOnDisk(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function hasReusableCachedFile(filePath: string, expectedSize?: number): Promise<boolean> {
+  try {
+    const stat = await fs.stat(filePath);
+    if (!stat.isFile() || stat.size <= 0) {
+      return false;
+    }
+    if (typeof expectedSize === "number" && Number.isFinite(expectedSize) && expectedSize >= 0) {
+      return stat.size === expectedSize;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function writeFileAtomic(targetPath: string, data: Buffer): Promise<void> {
+  const tmpPath = `${targetPath}.tmp-${crypto.randomUUID()}`;
+  await fs.writeFile(tmpPath, data);
+  try {
+    await fs.rename(tmpPath, targetPath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code !== "EEXIST" && code !== "EPERM") {
+      await fs.rm(tmpPath, { force: true }).catch(() => {});
+      throw err;
+    }
+    const backupPath = `${targetPath}.bak-${crypto.randomUUID()}`;
+    let movedOriginalToBackup = false;
+    try {
+      await fs.rename(targetPath, backupPath);
+      movedOriginalToBackup = true;
+      await fs.rename(tmpPath, targetPath);
+      await fs.rm(backupPath, { force: true }).catch(() => {});
+    } catch (swapErr) {
+      await fs.rm(tmpPath, { force: true }).catch(() => {});
+      if (movedOriginalToBackup) {
+        const targetExists = await existsOnDisk(targetPath);
+        if (!targetExists) {
+          await fs.rename(backupPath, targetPath).catch(() => {});
+        } else {
+          await fs.rm(backupPath, { force: true }).catch(() => {});
+        }
+      }
+      throw swapErr;
+    }
+  }
+}
+
+async function hydrateAttachmentToWorkspace(params: {
+  attachment: ProjectedAttachment;
+  token: string;
+  workspaceDir?: string;
+  sandboxed?: boolean;
+  forceReDownload?: boolean;
+  logger?: ToolLogger;
+}): Promise<Pick<ProjectedAttachment, "localPath" | "hydrationFailure">> {
+  // TODO: future hardening - if primary `url` fails, attempt one fallback fetch via `proxyUrl`.
+  const sourceUrl = params.attachment.url ?? params.attachment.proxyUrl;
+  if (!sourceUrl || !sourceUrl.trim()) {
+    params.logger?.warn?.(
+      "discord-thread-read attachment hydration failed: attachment missing URL/proxyUrl",
+      { attachmentId: params.attachment.id },
+    );
+    return { hydrationFailure: true };
+  }
+  if (!params.workspaceDir) {
+    params.logger?.warn?.(
+      "discord-thread-read attachment hydration failed: workspaceDir unavailable",
+      { attachmentId: params.attachment.id, url: sourceUrl },
+    );
+    return { hydrationFailure: true };
+  }
+
+  const relativePath = resolveHydrationRelativePath(sourceUrl);
+  const destination = toHostPathFromPosixRelative(params.workspaceDir, relativePath);
+  const shouldReuse =
+    !params.forceReDownload &&
+    (await hasReusableCachedFile(destination, params.attachment.size));
+  if (shouldReuse) {
+    return {
+      localPath: resolveCallerLocalPath({
+        workspaceDir: params.workspaceDir,
+        relativePath,
+        sandboxed: params.sandboxed,
+      }),
+    };
+  }
+
+  try {
+    const res = await fetchAttachmentWithRetry({ url: sourceUrl, token: params.token });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const body = Buffer.from(await res.arrayBuffer());
+    await fs.mkdir(path.dirname(destination), { recursive: true });
+    await writeFileAtomic(destination, body);
+    return {
+      localPath: resolveCallerLocalPath({
+        workspaceDir: params.workspaceDir,
+        relativePath,
+        sandboxed: params.sandboxed,
+      }),
+    };
+  } catch (err) {
+    params.logger?.warn?.("discord-thread-read attachment hydration failed", {
+      attachmentId: params.attachment.id,
+      url: sourceUrl,
+      error:
+        err instanceof Error
+          ? truncateErrorSummary(err.message)
+          : truncateErrorSummary(String(err)),
+    });
+    return { hydrationFailure: true };
+  }
+}
+
+async function hydrateProjectedMessageAttachments(params: {
+  messages: DiscordThreadReadMessage[];
+  token: string;
+  workspaceDir?: string;
+  sandboxed?: boolean;
+  forceReDownload?: boolean;
+  logger?: ToolLogger;
+}): Promise<void> {
+  for (const message of params.messages) {
+    if (!Array.isArray(message.attachments) || message.attachments.length === 0) {
+      continue;
+    }
+    for (const attachment of message.attachments) {
+      const hydration = await hydrateAttachmentToWorkspace({
+        attachment,
+        token: params.token,
+        workspaceDir: params.workspaceDir,
+        sandboxed: params.sandboxed,
+        forceReDownload: params.forceReDownload,
+        logger: params.logger,
+      });
+      if (hydration.localPath) {
+        attachment.localPath = hydration.localPath;
+      }
+      if (hydration.hydrationFailure) {
+        attachment.hydrationFailure = true;
+      }
+    }
+  }
+}
+
 function projectMessage(raw: DiscordRawMessage, params: DiscordThreadReadParams): DiscordThreadReadMessage | null {
   const type = raw.type ?? 0;
   const isSystem = type !== 0;
@@ -734,6 +1060,7 @@ export async function readThreadMessages(params: {
   read: DiscordThreadReadParams;
   allowedGuildId?: string;
   allowedParentChannelIds?: string[];
+  logger?: ToolLogger;
 }): Promise<DiscordThreadReadResult> {
   if (params.read.cursor && params.read.aroundMessageId) {
     throw new Error("cursor and aroundMessageId are mutually exclusive.");
@@ -774,7 +1101,11 @@ export async function readThreadMessages(params: {
       after = cursorPayload.anchorLastMessageId;
     }
   }
-  const effectiveLimit = Math.min(Math.max(Math.trunc(params.read.limit ?? cursorPayload?.limit ?? 30), 1), 100);
+  const defaultLimit = params.read.includeAttachments ? 5 : (cursorPayload?.limit ?? 30);
+  const effectiveLimit = Math.min(Math.max(Math.trunc(params.read.limit ?? defaultLimit), 1), 100);
+  if (params.read.includeAttachments && effectiveLimit > 5) {
+    throw new Error("When includeAttachments=true, limit must be <= 5.");
+  }
 
   const rawMessages = normalizeMessagesOldestToNewest(
     await fetchDiscordChannelMessages({
@@ -790,6 +1121,16 @@ export async function readThreadMessages(params: {
   const projected = rawMessages
     .map((message) => projectMessage(message, params.read))
     .filter((message): message is DiscordThreadReadMessage => !!message);
+  if (params.read.includeAttachments) {
+    await hydrateProjectedMessageAttachments({
+      messages: projected,
+      token: params.token,
+      workspaceDir: params.read.workspaceDir,
+      sandboxed: params.read.sandboxed,
+      forceReDownload: params.read.forceReDownload,
+      logger: params.logger,
+    });
+  }
   const returnedCount = projected.length;
   const rawCount = rawMessages.length;
   const filteredOutCount = Math.max(0, rawCount - returnedCount);
@@ -864,6 +1205,7 @@ export async function readThreadMessages(params: {
       includeContent: params.read.includeContent,
       contentMaxChars: params.read.contentMaxChars,
       includeSystem: params.read.includeSystem,
+      forceReDownload: !!params.read.forceReDownload,
     },
   };
   if (earlierCursor) {
@@ -878,6 +1220,7 @@ export async function readThreadMessages(params: {
       includeEmbeds: params.read.includeEmbeds,
       includeAttachments: params.read.includeAttachments,
       includeSystem: params.read.includeSystem,
+      forceReDownload: !!params.read.forceReDownload,
     };
   }
   if (laterCursor) {
@@ -892,6 +1235,7 @@ export async function readThreadMessages(params: {
       includeEmbeds: params.read.includeEmbeds,
       includeAttachments: params.read.includeAttachments,
       includeSystem: params.read.includeSystem,
+      forceReDownload: !!params.read.forceReDownload,
     };
   }
 
@@ -918,7 +1262,7 @@ export async function readThreadMessages(params: {
     attachmentMessageIds: attachmentMessageIds.length > 0 ? attachmentMessageIds : undefined,
     capabilities: {
       attachmentDetail:
-        "Attachment details are available by calling discord-thread-read with a concrete aroundMessageId and includeAttachments=true.",
+        "Attachment details are available by calling discord-thread-read with a concrete aroundMessageId, includeAttachments=true, and limit <= 5.",
     },
     nextActions,
   };

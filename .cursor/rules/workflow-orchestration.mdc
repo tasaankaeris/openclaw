@@ -1,0 +1,42 @@
+---
+description: Workflow orchestration patterns for planning, verification, and self-improvement
+globs: ["**/*"]
+alwaysApply: true
+---
+
+# Workflow Orchestration
+
+## Plan Mode
+
+- Use plan mode for tasks with 3+ steps or architectural decisions
+- Plan mode enforces readonly tools - use it to prevent premature action
+- Resolve ambiguity with the user before writing plan items (plans are decisions, not questions)
+
+## Persistent Lessons
+
+When the user corrects a mistake:
+1. Append the pattern to `tasks/lessons.md` (create if missing)
+2. Format: `## [Date] - [Category]` then concrete description of what went wrong and the correct approach
+3. When starting work on a project, check for existing `tasks/lessons.md` and read it
+
+This creates context that persists across sessions.
+
+## Verification
+
+Before marking work complete:
+- Run tests for changed code
+- Check linter output
+- For behavioral changes: diff against main branch
+- Demonstrate correctness with concrete evidence, not assertions
+
+## Bug Fixing
+
+When given a bug report with logs, errors, or failing tests:
+- Fix directly without asking clarifying questions
+- Only ask if the report lacks sufficient information to reproduce
+
+## Change Scope
+
+- Each change should touch minimal code necessary
+- Find root causes rather than patching symptoms
+- Simple solutions over clever ones when both work

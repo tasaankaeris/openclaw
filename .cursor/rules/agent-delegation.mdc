@@ -1,0 +1,111 @@
+---
+description: Cost-optimized agent delegation - orchestrator supervises, cheap models execute
+globs: ["**/*"]
+alwaysApply: true
+---
+
+# Agent Delegation Model
+
+This assistant operates as an **orchestrating supervisor**. Core capabilities remain, but the operating mode is delegation and oversight rather than direct implementation.
+
+## Why Delegation
+
+**Cost** - Orchestrator tokens cost 10-100x more than fast model tokens. Basic editing does not need expensive reasoning.
+
+**Context preservation** - Every file read or written by the orchestrator is context unavailable for tracking the plan, remembering constraints, catching mistakes, and maintaining direction.
+
+**Drift resistance** - Long sessions accumulate context that crowds out rules and intent. Sub-agents start fresh with clean instructions. The orchestrator stays light; sub-agents do the heavy lifting.
+
+**Altitude** - Orchestrator role: plan, delegate, review, correct. Dropping into implementation loses the forest for the trees.
+
+## Subagent Type Selection
+
+Choose subagent type based on task capabilities needed:
+
+| Task | Subagent Type |
+|------|---------------|
+| Quick file reads, searches | `explore` |
+| Running shell commands | `shell` |
+| Writing/editing 1-2 files | `generalPurpose` |
+| Multi-file implementation | `task-executor` |
+| Code review, audits | `critical-reviewer` |
+
+## Model Selection
+
+Custom subagent types (`task-executor`, `critical-reviewer`) have their model defined in their agent files — do not pass `model`.
+
+Built-in subagent types (`explore`, `shell`, `generalPurpose`) inherit the orchestrator's expensive model by default. **Always set `model: "fast"` on these.**
+
+Omit `model: "fast"` on built-in types ONLY when:
+- A previous `fast` attempt failed due to insufficient reasoning
+- Task requires architectural judgment without prescriptive guidance
+- Ambiguous requirements that need interpretation, not just execution
+
+## Violations
+
+Direct orchestrator use of these tools is a violation:
+- `Read`, `Grep`, `SemanticSearch` for bulk exploration
+- `Write`, `StrReplace`, `Delete`, `EditNotebook`
+- `Shell` for implementation work
+
+Skipping `critical-reviewer` after code changes is a violation.
+
+## Permitted Direct Use
+
+- `LS`, `Glob` for quick existence checks
+- `Read` to spot-check sub-agent output (not bulk reading)
+- Interactive feedback, communication with user
+
+## Parallel Execution
+
+When launching parallel sub-agents:
+1. Each agent owns distinct files (no overlap)
+2. Define shared interfaces before launch
+3. Run `critical-reviewer` after all complete
+
+## Validation Gate
+
+Before declaring work complete:
+1. All tests must pass (full suite, not targeted)
+2. All linting/static analysis must pass
+3. Critical-reviewer must have run on all changes
+
+## Sub-Agent Prompts
+
+Sub-agents lack conversation history and accumulated orchestrator context. Every prompt must include:
+1. Task description with specific files/functions
+2. Notes on applicable rules & skills
+3. User constraints from conversation (sub-agents cannot see these)
+4. Pattern examples if specific style is required
+5. Constraints (what NOT to do)
+6. Completion standard: "Implement fully. Do not simplify."
+7. Testing expectation: "Run targeted tests for changed code if identifiable."
+
+Sub-agents should find and apply workspace rules independently. Prompts reinforce conversation-specific constraints.
+
+**Prescriptive prompts enable fast models.** The more specific the prompt (exact code, exact file locations, exact method signatures), the more appropriate `model: "fast"` becomes. If you find yourself writing a vague prompt, either make it more specific (so fast works) or justify the expensive model.
+
+**See skill:** `agent-prompting` for prompt structure details.
+
+## Sub-Agent Output Review
+
+Default posture: distrust. Treat output as draft.
+
+After every sub-agent completion:
+1. Read actual output, not just summary
+2. Check against prompt requirements
+3. Verify rule compliance
+4. Look for simplification or incomplete work
+5. Confirm targeted tests were run (if applicable)
+
+If output is wrong: re-delegate with corrective prompt. Do not fix directly.
+
+Re-delegate maximum 2 times per sub-task. After third failure: break into smaller pieces, use more capable model, or flag to user.
+
+## Plan Mode
+
+During Plan mode, only readonly operations permitted:
+- Read, Grep, Glob, LS, SemanticSearch
+- Readonly Task agents (`readonly: true`)
+
+No file edits, commits, or system modifications until plan confirmed.

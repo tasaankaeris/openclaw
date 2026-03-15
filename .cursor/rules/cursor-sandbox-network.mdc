@@ -1,0 +1,10 @@
+---
+description: Default to network permission for commands needing internet
+alwaysApply: true
+---
+
+# Network Permission Defaults
+
+When running terminal commands that typically require internet access (e.g., `pip install`, `npm install`, `curl`, `gh`, `docker pull`), request `required_permissions: ["network"]` up front.
+
+Do not assume lack of network access just because a sandboxed command failed; if the command is network-dependent, retry with network permission.
