@@ -779,10 +779,61 @@ function canonicalizeAttachmentUrl(rawUrl: string): string {
   }
 }
 
-function resolveHydrationRelativePath(url: string): string {
+// RFC 4122 Appendix C: URL namespace UUID for name-based UUIDs from URLs.
+export const URL_NAMESPACE_UUID = "6ba7b811-9dad-11d1-80b4-00c04fd430c8";
+
+/**
+ * Deterministic UUID from SHA-256 of (namespace + canonical URL) per RFC 9562.
+ * RFC 4122 permits only SHA-1 for version 5; name-based UUIDs from SHA-256 MUST use
+ * UUIDv8 (RFC 9562 §5.8, §5.5 note, Appendix B.2).
+ * Concatenates URL namespace UUID bytes + canonical URL UTF-8 bytes, hashes with SHA-256,
+ * takes first 16 octets, sets version nibble (octet 6) to 8 and variant (octet 8) to 10xx.
+ */
+export function canonicalUrlToGuid(canonicalUrl: string): string {
+  const namespaceBytes = Buffer.from(URL_NAMESPACE_UUID.replace(/-/g, ""), "hex");
+  const nameBytes = Buffer.from(canonicalUrl, "utf8");
+  const combined = Buffer.concat([namespaceBytes, nameBytes]);
+  const hash = crypto.createHash("sha256").update(combined).digest();
+  const raw = hash.subarray(0, 16);
+  raw[6] = (raw[6]! & 0x0f) | 0x80; // version 8 (RFC 9562)
+  raw[8] = (raw[8]! & 0x3f) | 0x80; // variant (RFC 4122/9562 §4.1)
+  const hex = raw.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
+/**
+ * Safe attachment basename: prevents path traversal and reserved characters.
+ *
+ * Discord API supplies filename; normally valid, but guard against path separators (/, \),
+ * dot segments (., ..), control chars, and Windows reserved chars that could break hydration.
+ *
+ * Security rationale:
+ * - Backslash on Windows is a path separator; `toHostPathFromPosixRelative` splits only on `/`
+ *   then uses `path.join`, which treats `\` as a separator on Windows. Without normalization,
+ *   a filename like `..\\..\\evil.txt` could escape `media/inbound/{guid}`.
+ * - Forward-slash and dot-segments can also escape or collide.
+ * - Control chars and Windows reserved chars (: * ? " < > |) may cause IO failures.
+ *
+ * Falls back to hash when any dangerous character is present or basename is empty/dot-segment.
+ */
+function safeAttachmentBasename(filename: string | undefined, hash: string): string {
+  if (!filename || !filename.trim()) return hash;
+  const normalized = filename.trim().replaceAll("\\", "/");
+  const base = path.posix.basename(normalized);
+  if (!base || base === "." || base === "..") return hash;
+  // Reject any remaining path separators (shouldn't happen post-basename, but defensive)
+  if (base.includes("/") || base.includes("\\")) return hash;
+  // Reject control chars (0x00-0x1F, 0x7F) and Windows reserved chars (: * ? " < > |)
+  if (/[\x00-\x1F\x7F:*?"<>|]/.test(base)) return hash;
+  return base;
+}
+
+function resolveHydrationRelativePath(url: string, filename?: string): string {
   const canonical = canonicalizeAttachmentUrl(url);
   const hash = crypto.createHash("sha256").update(canonical, "utf8").digest("hex");
-  return path.posix.join("media", "inbound", hash);
+  const guid = canonicalUrlToGuid(canonical);
+  const safeName = safeAttachmentBasename(filename, hash);
+  return path.posix.join("media", "inbound", guid, safeName);
 }
 
 function resolveCallerLocalPath(params: {
@@ -878,7 +929,7 @@ async function hydrateAttachmentToWorkspace(params: {
     return { hydrationFailure: true };
   }
 
-  const relativePath = resolveHydrationRelativePath(sourceUrl);
+  const relativePath = resolveHydrationRelativePath(sourceUrl, params.attachment.filename);
   const destination = toHostPathFromPosixRelative(params.workspaceDir, relativePath);
   const shouldReuse =
     !params.forceReDownload &&

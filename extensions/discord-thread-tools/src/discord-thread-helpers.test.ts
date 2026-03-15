@@ -6,12 +6,14 @@ import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "openclaw/plugin-sdk";
 import {
   assertThreadBelongsToAllowedParent,
+  canonicalUrlToGuid,
   discordFetch,
   encodeThreadReadCursor,
   normalizeReactionEmoji,
   readThreadMessages,
   resolveDiscordBotToken,
   resolveSandboxContainerWorkdirFromConfig,
+  URL_NAMESPACE_UUID,
   validateAttachmentFilePath,
 } from "./discord-thread-helpers";
 
@@ -32,6 +34,39 @@ vi.mock("openclaw/plugin-sdk", async () => {
       };
     }),
   };
+});
+
+describe("canonicalUrlToGuid", () => {
+  it("generates RFC 9562 UUIDv8 from canonical URL with URL namespace", () => {
+    const url = "https://cdn.example.com/file.txt";
+    const guid = canonicalUrlToGuid(url);
+    
+    // Should be valid UUID format
+    expect(guid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    
+    // Version nibble (char 14) should be 8
+    expect(guid[14]).toBe("8");
+    
+    // Variant bits (char 19) should be 8, 9, a, or b (10xx in binary)
+    expect(["8", "9", "a", "b"]).toContain(guid[19]);
+  });
+
+  it("produces deterministic UUIDs for same URL", () => {
+    const url = "https://cdn.example.com/test.jpg";
+    const guid1 = canonicalUrlToGuid(url);
+    const guid2 = canonicalUrlToGuid(url);
+    expect(guid1).toBe(guid2);
+  });
+
+  it("produces different UUIDs for different URLs", () => {
+    const guid1 = canonicalUrlToGuid("https://cdn.example.com/a.txt");
+    const guid2 = canonicalUrlToGuid("https://cdn.example.com/b.txt");
+    expect(guid1).not.toBe(guid2);
+  });
+
+  it("uses RFC 4122 URL namespace UUID", () => {
+    expect(URL_NAMESPACE_UUID).toBe("6ba7b811-9dad-11d1-80b4-00c04fd430c8");
+  });
 });
 
 describe("resolveDiscordBotToken", () => {
@@ -1064,7 +1099,7 @@ describe("readThreadMessages", () => {
     const workspaceDir = await createTempWorkspaceDir();
     try {
       const attachmentUrl = "https://cdn.example/specific.txt";
-      const expectedHash = crypto.createHash("sha256").update(attachmentUrl, "utf8").digest("hex");
+      const expectedGuid = canonicalUrlToGuid(attachmentUrl);
       const fetchMock = vi.fn().mockImplementation((url: string) => {
         if (url.includes("/messages?")) {
           return Promise.resolve(
@@ -1122,7 +1157,325 @@ describe("readThreadMessages", () => {
         },
       });
 
-      expect(result.messages[0]?.attachments?.[0]?.localPath).toBe(`media/inbound/${expectedHash}`);
+      expect(result.messages[0]?.attachments?.[0]?.localPath).toBe(`media/inbound/${expectedGuid}/specific.txt`);
+      expect(result.messages[0]?.attachments?.[0]?.hydrationFailure).toBeUndefined();
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("uses hash as filename when attachment has no or invalid filename", async () => {
+    const workspaceDir = await createTempWorkspaceDir();
+    try {
+      const attachmentUrl = "https://cdn.example/no-filename";
+      const expectedHash = crypto.createHash("sha256").update(attachmentUrl, "utf8").digest("hex");
+      const expectedGuid = canonicalUrlToGuid(attachmentUrl);
+      const fetchMock = vi.fn().mockImplementation((url: string) => {
+        if (url.includes("/messages?")) {
+          return Promise.resolve(
+            createMockResponse({
+              ok: true,
+              json: [
+                {
+                  id: "900000000000000086",
+                  type: 0,
+                  author: { id: "u86", username: "u86" },
+                  content: "no filename",
+                  timestamp: "2026-03-01T00:00:86.000Z",
+                  attachments: [{ id: "att-86", url: attachmentUrl }],
+                },
+              ],
+            }),
+          );
+        }
+        if (url === attachmentUrl) {
+          return Promise.resolve(createMockResponse({ ok: true, bytes: Buffer.from("payload") }));
+        }
+        return Promise.resolve(
+          createMockResponse({
+            ok: true,
+            json: { id: "thread-1", type: 11, guild_id: "guild-1", parent_id: "parent-1" },
+          }),
+        );
+      });
+      // @ts-expect-error override global fetch for test
+      global.fetch = fetchMock;
+
+      const result = await readThreadMessages({
+        token: "bot-token",
+        allowedGuildId: "guild-1",
+        allowedParentChannelIds: ["parent-1"],
+        read: {
+          accountId: "default",
+          threadId: "thread-1",
+          limit: 1,
+          includeContent: true,
+          contentMaxChars: 400,
+          includeSystem: false,
+          includeEmbeds: false,
+          includeAttachments: true,
+          workspaceDir,
+          sandboxed: true,
+        },
+      });
+
+      expect(result.messages[0]?.attachments?.[0]?.localPath).toBe(`media/inbound/${expectedGuid}/${expectedHash}`);
+      expect(result.messages[0]?.attachments?.[0]?.hydrationFailure).toBeUndefined();
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("sanitizes filename with path separators to avoid traversal", async () => {
+    const workspaceDir = await createTempWorkspaceDir();
+    try {
+      const attachmentUrl = "https://cdn.example/traversal";
+      const expectedHash = crypto.createHash("sha256").update(attachmentUrl, "utf8").digest("hex");
+      const expectedGuid = canonicalUrlToGuid(attachmentUrl);
+      const fetchMock = vi.fn().mockImplementation((url: string) => {
+        if (url.includes("/messages?")) {
+          return Promise.resolve(
+            createMockResponse({
+              ok: true,
+              json: [
+                {
+                  id: "900000000000000087",
+                  type: 0,
+                  author: { id: "u87", username: "u87" },
+                  content: "traversal",
+                  timestamp: "2026-03-01T00:00:87.000Z",
+                  attachments: [
+                    { id: "att-87", filename: "..\\..\\evil.txt", url: attachmentUrl },
+                  ],
+                },
+              ],
+            }),
+          );
+        }
+        if (url === attachmentUrl) {
+          return Promise.resolve(createMockResponse({ ok: true, bytes: Buffer.from("x") }));
+        }
+        return Promise.resolve(
+          createMockResponse({
+            ok: true,
+            json: { id: "thread-1", type: 11, guild_id: "guild-1", parent_id: "parent-1" },
+          }),
+        );
+      });
+      // @ts-expect-error override global fetch for test
+      global.fetch = fetchMock;
+
+      const result = await readThreadMessages({
+        token: "bot-token",
+        allowedGuildId: "guild-1",
+        allowedParentChannelIds: ["parent-1"],
+        read: {
+          accountId: "default",
+          threadId: "thread-1",
+          limit: 1,
+          includeContent: true,
+          contentMaxChars: 400,
+          includeSystem: false,
+          includeEmbeds: false,
+          includeAttachments: true,
+          workspaceDir,
+          sandboxed: true,
+        },
+      });
+
+      expect(result.messages[0]?.attachments?.[0]?.localPath).toBe(`media/inbound/${expectedGuid}/evil.txt`);
+      expect(result.messages[0]?.attachments?.[0]?.hydrationFailure).toBeUndefined();
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("sanitizes filename with forward-slash to avoid traversal", async () => {
+    const workspaceDir = await createTempWorkspaceDir();
+    try {
+      const attachmentUrl = "https://cdn.example/forward-slash";
+      const expectedHash = crypto.createHash("sha256").update(attachmentUrl, "utf8").digest("hex");
+      const expectedGuid = canonicalUrlToGuid(attachmentUrl);
+      const fetchMock = vi.fn().mockImplementation((url: string) => {
+        if (url.includes("/messages?")) {
+          return Promise.resolve(
+            createMockResponse({
+              ok: true,
+              json: [
+                {
+                  id: "900000000000000088",
+                  type: 0,
+                  author: { id: "u88", username: "u88" },
+                  content: "forward slash",
+                  timestamp: "2026-03-01T00:00:88.000Z",
+                  attachments: [
+                    { id: "att-88", filename: "../other/file.txt", url: attachmentUrl },
+                  ],
+                },
+              ],
+            }),
+          );
+        }
+        if (url === attachmentUrl) {
+          return Promise.resolve(createMockResponse({ ok: true, bytes: Buffer.from("x") }));
+        }
+        return Promise.resolve(
+          createMockResponse({
+            ok: true,
+            json: { id: "thread-1", type: 11, guild_id: "guild-1", parent_id: "parent-1" },
+          }),
+        );
+      });
+      // @ts-expect-error override global fetch for test
+      global.fetch = fetchMock;
+
+      const result = await readThreadMessages({
+        token: "bot-token",
+        allowedGuildId: "guild-1",
+        allowedParentChannelIds: ["parent-1"],
+        read: {
+          accountId: "default",
+          threadId: "thread-1",
+          limit: 1,
+          includeContent: true,
+          contentMaxChars: 400,
+          includeSystem: false,
+          includeEmbeds: false,
+          includeAttachments: true,
+          workspaceDir,
+          sandboxed: true,
+        },
+      });
+
+      expect(result.messages[0]?.attachments?.[0]?.localPath).toBe(`media/inbound/${expectedGuid}/file.txt`);
+      expect(result.messages[0]?.attachments?.[0]?.hydrationFailure).toBeUndefined();
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("uses hash when filename contains Windows reserved characters", async () => {
+    const workspaceDir = await createTempWorkspaceDir();
+    try {
+      const attachmentUrl = "https://cdn.example/reserved-chars";
+      const expectedHash = crypto.createHash("sha256").update(attachmentUrl, "utf8").digest("hex");
+      const expectedGuid = canonicalUrlToGuid(attachmentUrl);
+      const fetchMock = vi.fn().mockImplementation((url: string) => {
+        if (url.includes("/messages?")) {
+          return Promise.resolve(
+            createMockResponse({
+              ok: true,
+              json: [
+                {
+                  id: "900000000000000089",
+                  type: 0,
+                  author: { id: "u89", username: "u89" },
+                  content: "reserved",
+                  timestamp: "2026-03-01T00:00:89.000Z",
+                  attachments: [
+                    { id: "att-89", filename: "file:name.txt", url: attachmentUrl },
+                  ],
+                },
+              ],
+            }),
+          );
+        }
+        if (url === attachmentUrl) {
+          return Promise.resolve(createMockResponse({ ok: true, bytes: Buffer.from("x") }));
+        }
+        return Promise.resolve(
+          createMockResponse({
+            ok: true,
+            json: { id: "thread-1", type: 11, guild_id: "guild-1", parent_id: "parent-1" },
+          }),
+        );
+      });
+      // @ts-expect-error override global fetch for test
+      global.fetch = fetchMock;
+
+      const result = await readThreadMessages({
+        token: "bot-token",
+        allowedGuildId: "guild-1",
+        allowedParentChannelIds: ["parent-1"],
+        read: {
+          accountId: "default",
+          threadId: "thread-1",
+          limit: 1,
+          includeContent: true,
+          contentMaxChars: 400,
+          includeSystem: false,
+          includeEmbeds: false,
+          includeAttachments: true,
+          workspaceDir,
+          sandboxed: true,
+        },
+      });
+
+      expect(result.messages[0]?.attachments?.[0]?.localPath).toBe(`media/inbound/${expectedGuid}/${expectedHash}`);
+      expect(result.messages[0]?.attachments?.[0]?.hydrationFailure).toBeUndefined();
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("uses hash for dot-segment filename", async () => {
+    const workspaceDir = await createTempWorkspaceDir();
+    try {
+      const attachmentUrl = "https://cdn.example/dot-segment";
+      const expectedHash = crypto.createHash("sha256").update(attachmentUrl, "utf8").digest("hex");
+      const expectedGuid = canonicalUrlToGuid(attachmentUrl);
+      const fetchMock = vi.fn().mockImplementation((url: string) => {
+        if (url.includes("/messages?")) {
+          return Promise.resolve(
+            createMockResponse({
+              ok: true,
+              json: [
+                {
+                  id: "900000000000000090",
+                  type: 0,
+                  author: { id: "u90", username: "u90" },
+                  content: "dot segment",
+                  timestamp: "2026-03-01T00:00:90.000Z",
+                  attachments: [
+                    { id: "att-90", filename: "..", url: attachmentUrl },
+                  ],
+                },
+              ],
+            }),
+          );
+        }
+        if (url === attachmentUrl) {
+          return Promise.resolve(createMockResponse({ ok: true, bytes: Buffer.from("x") }));
+        }
+        return Promise.resolve(
+          createMockResponse({
+            ok: true,
+            json: { id: "thread-1", type: 11, guild_id: "guild-1", parent_id: "parent-1" },
+          }),
+        );
+      });
+      // @ts-expect-error override global fetch for test
+      global.fetch = fetchMock;
+
+      const result = await readThreadMessages({
+        token: "bot-token",
+        allowedGuildId: "guild-1",
+        allowedParentChannelIds: ["parent-1"],
+        read: {
+          accountId: "default",
+          threadId: "thread-1",
+          limit: 1,
+          includeContent: true,
+          contentMaxChars: 400,
+          includeSystem: false,
+          includeEmbeds: false,
+          includeAttachments: true,
+          workspaceDir,
+          sandboxed: true,
+        },
+      });
+
+      expect(result.messages[0]?.attachments?.[0]?.localPath).toBe(`media/inbound/${expectedGuid}/${expectedHash}`);
       expect(result.messages[0]?.attachments?.[0]?.hydrationFailure).toBeUndefined();
     } finally {
       await fs.rm(workspaceDir, { recursive: true, force: true });
@@ -1313,7 +1666,8 @@ describe("readThreadMessages", () => {
       const attachmentUrl = "https://cdn.example/zero-byte.txt?sig=xyz";
       const canonicalUrl = "https://cdn.example/zero-byte.txt";
       const hash = crypto.createHash("sha256").update(canonicalUrl, "utf8").digest("hex");
-      const cachePath = path.join(workspaceDir, "media", "inbound", hash);
+      const guid = canonicalUrlToGuid(canonicalUrl);
+      const cachePath = path.join(workspaceDir, "media", "inbound", guid, "zero-byte.txt");
       await fs.mkdir(path.dirname(cachePath), { recursive: true });
       await fs.writeFile(cachePath, Buffer.alloc(0));
 
@@ -1368,7 +1722,7 @@ describe("readThreadMessages", () => {
         },
       });
       expect(attachmentFetchCount).toBe(1);
-      expect(result.messages[0]?.attachments?.[0]?.localPath).toBe(`media/inbound/${hash}`);
+      expect(result.messages[0]?.attachments?.[0]?.localPath).toBe(`media/inbound/${guid}/zero-byte.txt`);
     } finally {
       await fs.rm(workspaceDir, { recursive: true, force: true });
     }
@@ -1380,7 +1734,8 @@ describe("readThreadMessages", () => {
       const attachmentUrl = "https://cdn.example/size-check.txt";
       const canonicalUrl = "https://cdn.example/size-check.txt";
       const hash = crypto.createHash("sha256").update(canonicalUrl, "utf8").digest("hex");
-      const cachePath = path.join(workspaceDir, "media", "inbound", hash);
+      const guid = canonicalUrlToGuid(canonicalUrl);
+      const cachePath = path.join(workspaceDir, "media", "inbound", guid, "size-check.txt");
       await fs.mkdir(path.dirname(cachePath), { recursive: true });
       await fs.writeFile(cachePath, Buffer.from("short"));
 
@@ -1447,6 +1802,7 @@ describe("readThreadMessages", () => {
     try {
       const attachmentUrl = "https://cdn.example/non-sandbox.txt";
       const expectedHash = crypto.createHash("sha256").update("https://cdn.example/non-sandbox.txt", "utf8").digest("hex");
+      const expectedGuid = canonicalUrlToGuid(attachmentUrl);
       const fetchMock = vi.fn().mockImplementation((url: string) => {
         if (url.includes("/messages?")) {
           return Promise.resolve(
@@ -1495,7 +1851,7 @@ describe("readThreadMessages", () => {
         },
       });
       expect(result.messages[0]?.attachments?.[0]?.localPath).toBe(
-        path.join(workspaceDir, "media", "inbound", expectedHash),
+        path.join(workspaceDir, "media", "inbound", expectedGuid, "non-sandbox.txt"),
       );
     } finally {
       await fs.rm(workspaceDir, { recursive: true, force: true });
@@ -1571,7 +1927,9 @@ describe("readThreadMessages", () => {
           sandboxed: true,
         },
       });
-      expect(result.messages[0]?.attachments?.[0]?.localPath).toMatch(/^media\/inbound\/[a-f0-9]{64}$/);
+      expect(result.messages[0]?.attachments?.[0]?.localPath).toMatch(
+        /^media\/inbound\/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\/retry\.txt$/,
+      );
       expect(attachmentAttempts).toBe(3);
     } finally {
       await fs.rm(workspaceDir, { recursive: true, force: true });
