@@ -138,14 +138,24 @@ export function resolveSandboxFsPathWithMounts(params: {
     const containerPath = relPosix
       ? path.posix.join(hostMount.containerRoot, relPosix)
       : hostMount.containerRoot;
+    // If a more specific mount shadows this path in the container, use it so resolution and safety agree.
+    const containerMount = findMountByContainerPath(mountsByContainer, containerPath);
+    const mount = containerMount && containerMount !== hostMount ? containerMount : hostMount;
+    const hostPath =
+      mount === hostMount
+        ? hostResolved
+        : path.resolve(
+            mount.hostRoot,
+            ...toHostSegments(path.posix.relative(mount.containerRoot, containerPath)),
+          );
     return {
-      hostPath: hostResolved,
+      hostPath,
       containerPath,
       relativePath: toDisplayRelative({
         containerPath,
         defaultContainerRoot: params.defaultContainerRoot,
       }),
-      writable: hostMount.writable,
+      writable: mount.writable,
     };
   }
 
