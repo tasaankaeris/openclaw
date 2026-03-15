@@ -1,3 +1,29 @@
+/**
+ * Discord thread helper primitives used by the discord-thread-tools extension.
+ *
+ * Design notes for `discord-thread-read`
+ * --------------------------------------
+ * - The read tool is objective-neutral: it returns factual thread data plus
+ *   neutral navigation primitives; it must not push intent-specific workflows.
+ * - External pagination vocabulary is `earlier`/`later` to reduce ambiguity.
+ *   Internally this maps directly to Discord `before`/`after` message queries.
+ * - Pagination is anchor-relative for a live thread. New incoming messages may
+ *   appear on `later` reads by design.
+ * - Navigation actions returned by the tool are fully executable and include
+ *   explicit effective optional values (no hidden defaults at replay time).
+ * - Attachment output is metadata only (`url` / `proxyUrl` plus descriptors);
+ *   no inline binary or base64 payloads are returned by read operations.
+ * - Attachment handling is capability-based and metadata-driven: the tool
+ *   exposes how to retrieve details but does not inject objective-specific
+ *   follow-up actions.
+ * - System-message filtering (`includeSystem=false`) is presentation-only.
+ *   Cursor anchors and boundary ids are derived from the raw fetched window.
+ *   Read outputs include explicit `rawCount`, `filteredOutCount`, and optional
+ *   `filtered` fields to make this behavior observable to callers.
+ * - Around reads (`aroundMessageId`) provide centered context; callers can
+ *   fetch attachment details by combining `aroundMessageId` with
+ *   `includeAttachments=true`.
+ */
 import path from "node:path";
 import type { OpenClawConfig } from "openclaw/plugin-sdk";
 import { resolveDiscordAccount } from "openclaw/plugin-sdk";
@@ -11,6 +37,158 @@ export type DiscordChannel = {
   type: number;
   guild_id?: string;
   parent_id?: string;
+};
+
+type DiscordRawAuthor = {
+  id?: string;
+  username?: string;
+};
+
+type DiscordRawAttachment = {
+  id: string;
+  filename?: string;
+  content_type?: string;
+  size?: number;
+  url?: string;
+  proxy_url?: string;
+};
+
+type DiscordRawEmbed = {
+  type?: string;
+  title?: string;
+  description?: string;
+  url?: string;
+};
+
+export type DiscordRawMessage = {
+  id: string;
+  author?: DiscordRawAuthor;
+  content?: string;
+  timestamp?: string;
+  type?: number;
+  attachments?: DiscordRawAttachment[];
+  embeds?: DiscordRawEmbed[];
+};
+
+type ThreadReadCursorPayload = {
+  v: 1;
+  threadId: string;
+  dir: "earlier" | "later";
+  anchorFirstMessageId: string;
+  anchorLastMessageId: string;
+  limit: number;
+  snapshotNewestMessageId?: string;
+  issuedAt?: number;
+};
+
+export type DiscordThreadReadDirection = "earlier" | "later";
+
+export type DiscordThreadReadParams = {
+  accountId: string;
+  threadId: string;
+  limit?: number;
+  cursor?: string;
+  direction?: DiscordThreadReadDirection;
+  aroundMessageId?: string;
+  includeContent: boolean;
+  contentMaxChars: number;
+  includeSystem: boolean;
+  includeEmbeds: boolean;
+  includeAttachments: boolean;
+};
+
+type ProjectedAttachment = {
+  id: string;
+  filename?: string;
+  contentType?: string;
+  size?: number;
+  url?: string;
+  proxyUrl?: string;
+};
+
+type ProjectedEmbed = {
+  type?: string;
+  title?: string;
+  description?: string;
+  url?: string;
+};
+
+export type DiscordThreadReadMessage = {
+  id: string;
+  authorId: string;
+  authorName: string;
+  content?: string;
+  createdAt: string;
+  isSystem: boolean;
+  hasAttachments: boolean;
+  attachmentCount: number;
+  hasEmbeds: boolean;
+  embedCount: number;
+  attachments?: ProjectedAttachment[];
+  embeds?: ProjectedEmbed[];
+};
+
+export type DiscordThreadReadResult = {
+  ok: true;
+  threadId: string;
+  messages: DiscordThreadReadMessage[];
+  returnedCount: number;
+  rawCount: number;
+  filteredOutCount: number;
+  filtered?: { systemMessagesOmitted: number };
+  earlierCursor?: string;
+  laterCursor?: string;
+  dedupeKey: "id";
+  window: {
+    oldestId: string;
+    newestId: string;
+    boundaryExcludesAnchor: true;
+  };
+  progress: {
+    canReadEarlier: boolean;
+    canReadLater: boolean;
+  };
+  attachmentMessageIds?: string[];
+  capabilities: {
+    attachmentDetail: string;
+  };
+  nextActions?: {
+    readEarlierRequest?: {
+      accountId: string;
+      threadId: string;
+      cursor: string;
+      direction: "earlier";
+      limit: number;
+      includeContent: boolean;
+      contentMaxChars: number;
+      includeEmbeds: boolean;
+      includeAttachments: boolean;
+      includeSystem: boolean;
+    };
+    readLaterRequest?: {
+      accountId: string;
+      threadId: string;
+      cursor: string;
+      direction: "later";
+      limit: number;
+      includeContent: boolean;
+      contentMaxChars: number;
+      includeEmbeds: boolean;
+      includeAttachments: boolean;
+      includeSystem: boolean;
+    };
+    aroundMessageTemplate: {
+      accountId: string;
+      threadId: string;
+      aroundMessageId: string;
+      limit: number;
+      includeAttachments: boolean;
+      includeEmbeds: boolean;
+      includeContent: boolean;
+      contentMaxChars: number;
+      includeSystem: boolean;
+    };
+  };
 };
 
 /** Discord channel type: 1 = DM, 3 = group DM. */
@@ -361,5 +539,388 @@ export async function assertThreadBelongsToAllowedParent(params: {
       );
     }
   }
+}
+
+export function isDiscordSnowflake(raw: string): boolean {
+  const value = raw.trim();
+  if (!/^\d{16,22}$/.test(value)) {
+    return false;
+  }
+  try {
+    void BigInt(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function encodeThreadReadCursor(payload: ThreadReadCursorPayload): string {
+  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+}
+
+function decodeThreadReadCursor(rawCursor: string): ThreadReadCursorPayload {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(Buffer.from(rawCursor, "base64url").toString("utf8"));
+  } catch (err) {
+    throw new Error(`Invalid cursor format: ${String(err)}`);
+  }
+  if (!decoded || typeof decoded !== "object") {
+    throw new Error("Invalid cursor payload.");
+  }
+  const cursor = decoded as Partial<ThreadReadCursorPayload>;
+  if (cursor.v !== 1) {
+    throw new Error(`Unsupported cursor version: ${String(cursor.v)}`);
+  }
+  if (typeof cursor.threadId !== "string" || !isDiscordSnowflake(cursor.threadId)) {
+    throw new Error("Cursor missing valid threadId.");
+  }
+  if (cursor.dir !== "earlier" && cursor.dir !== "later") {
+    throw new Error("Cursor missing valid dir.");
+  }
+  if (
+    typeof cursor.anchorFirstMessageId !== "string" ||
+    !isDiscordSnowflake(cursor.anchorFirstMessageId)
+  ) {
+    throw new Error("Cursor missing valid anchorFirstMessageId.");
+  }
+  if (
+    typeof cursor.anchorLastMessageId !== "string" ||
+    !isDiscordSnowflake(cursor.anchorLastMessageId)
+  ) {
+    throw new Error("Cursor missing valid anchorLastMessageId.");
+  }
+  if (typeof cursor.limit !== "number" || !Number.isFinite(cursor.limit)) {
+    throw new Error("Cursor missing valid limit.");
+  }
+  return cursor as ThreadReadCursorPayload;
+}
+
+function clipText(content: string, maxChars: number): string {
+  if (content.length <= maxChars) {
+    return content;
+  }
+  if (maxChars <= 0) {
+    return "";
+  }
+  return `${content.slice(0, maxChars)} ...(truncated)`;
+}
+
+function messageIdComparatorAsc(a: string, b: string): number {
+  try {
+    const aBig = BigInt(a);
+    const bBig = BigInt(b);
+    if (aBig < bBig) {
+      return -1;
+    }
+    if (aBig > bBig) {
+      return 1;
+    }
+    return 0;
+  } catch {
+    return a.localeCompare(b);
+  }
+}
+
+function normalizeMessagesOldestToNewest(messages: DiscordRawMessage[]): DiscordRawMessage[] {
+  return [...messages].sort((a, b) => messageIdComparatorAsc(a.id, b.id));
+}
+
+function projectMessage(raw: DiscordRawMessage, params: DiscordThreadReadParams): DiscordThreadReadMessage | null {
+  const type = raw.type ?? 0;
+  const isSystem = type !== 0;
+  if (!params.includeSystem && isSystem) {
+    return null;
+  }
+  const attachments = Array.isArray(raw.attachments) ? raw.attachments : [];
+  const embeds = Array.isArray(raw.embeds) ? raw.embeds : [];
+  return {
+    id: raw.id,
+    authorId: raw.author?.id ?? "",
+    authorName: raw.author?.username ?? "",
+    content:
+      params.includeContent && typeof raw.content === "string"
+        ? clipText(raw.content, params.contentMaxChars)
+        : undefined,
+    createdAt: raw.timestamp ?? "",
+    isSystem,
+    hasAttachments: attachments.length > 0,
+    attachmentCount: attachments.length,
+    hasEmbeds: embeds.length > 0,
+    embedCount: embeds.length,
+    attachments: params.includeAttachments
+      ? attachments.map((attachment) => ({
+          id: attachment.id,
+          filename: attachment.filename,
+          contentType: attachment.content_type,
+          size: attachment.size,
+          url: attachment.url,
+          proxyUrl: attachment.proxy_url,
+        }))
+      : undefined,
+    embeds: params.includeEmbeds
+      ? embeds.map((embed) => ({
+          type: embed.type,
+          title: embed.title,
+          description: embed.description,
+          url: embed.url,
+        }))
+      : undefined,
+  };
+}
+
+function buildChannelMessagesUrl(params: {
+  channelId: string;
+  limit: number;
+  before?: string;
+  after?: string;
+  around?: string;
+}): string {
+  const search = new URLSearchParams();
+  search.set("limit", String(params.limit));
+  if (params.before) {
+    search.set("before", params.before);
+  }
+  if (params.after) {
+    search.set("after", params.after);
+  }
+  if (params.around) {
+    search.set("around", params.around);
+  }
+  return `${DISCORD_API_BASE}/channels/${params.channelId}/messages?${search.toString()}`;
+}
+
+async function fetchDiscordChannelMessages(params: {
+  token: string;
+  channelId: string;
+  limit: number;
+  before?: string;
+  after?: string;
+  around?: string;
+}): Promise<DiscordRawMessage[]> {
+  const res = await discordFetch(
+    params.token,
+    buildChannelMessagesUrl(params),
+    { method: "GET" },
+  );
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(formatDiscordError("thread read", res.status, body.slice(0, 500)));
+  }
+  const data = await safeJson<unknown>(res, "thread read");
+  if (!Array.isArray(data)) {
+    throw new Error("Discord thread read response is not an array.");
+  }
+  return data
+    .filter((entry): entry is DiscordRawMessage => {
+      return !!entry && typeof entry === "object" && typeof (entry as { id?: unknown }).id === "string";
+    })
+    .map((entry) => entry as DiscordRawMessage);
+}
+
+function attachmentMessageIdsFromRaw(rawMessages: DiscordRawMessage[]): string[] {
+  const ids: string[] = [];
+  for (let idx = rawMessages.length - 1; idx >= 0; idx -= 1) {
+    const msg = rawMessages[idx];
+    if (Array.isArray(msg.attachments) && msg.attachments.length > 0) {
+      ids.push(msg.id);
+    }
+  }
+  return ids;
+}
+
+export async function readThreadMessages(params: {
+  token: string;
+  read: DiscordThreadReadParams;
+  allowedGuildId?: string;
+  allowedParentChannelIds?: string[];
+}): Promise<DiscordThreadReadResult> {
+  if (params.read.cursor && params.read.aroundMessageId) {
+    throw new Error("cursor and aroundMessageId are mutually exclusive.");
+  }
+  if (params.read.direction && !params.read.cursor) {
+    throw new Error("direction requires cursor.");
+  }
+  if (params.read.direction && params.read.aroundMessageId) {
+    throw new Error("direction cannot be used with aroundMessageId.");
+  }
+
+  await assertThreadBelongsToAllowedParent({
+    token: params.token,
+    threadId: params.read.threadId,
+    allowedGuildId: params.allowedGuildId,
+    allowedParentChannelIds: params.allowedParentChannelIds,
+  });
+
+  let effectiveDirection: DiscordThreadReadDirection = "earlier";
+  let cursorPayload: ThreadReadCursorPayload | undefined;
+  let before: string | undefined;
+  let after: string | undefined;
+  let around: string | undefined;
+
+  if (params.read.aroundMessageId) {
+    around = params.read.aroundMessageId;
+  } else if (params.read.cursor) {
+    cursorPayload = decodeThreadReadCursor(params.read.cursor);
+    if (cursorPayload.threadId !== params.read.threadId) {
+      throw new Error(
+        `Cursor threadId ${cursorPayload.threadId} does not match requested threadId ${params.read.threadId}.`,
+      );
+    }
+    effectiveDirection = params.read.direction ?? cursorPayload.dir;
+    if (effectiveDirection === "earlier") {
+      before = cursorPayload.anchorFirstMessageId;
+    } else {
+      after = cursorPayload.anchorLastMessageId;
+    }
+  }
+  const effectiveLimit = Math.min(Math.max(Math.trunc(params.read.limit ?? cursorPayload?.limit ?? 30), 1), 100);
+
+  const rawMessages = normalizeMessagesOldestToNewest(
+    await fetchDiscordChannelMessages({
+      token: params.token,
+      channelId: params.read.threadId,
+      limit: effectiveLimit,
+      before,
+      after,
+      around,
+    }),
+  );
+
+  const projected = rawMessages
+    .map((message) => projectMessage(message, params.read))
+    .filter((message): message is DiscordThreadReadMessage => !!message);
+  const returnedCount = projected.length;
+  const rawCount = rawMessages.length;
+  const filteredOutCount = Math.max(0, rawCount - returnedCount);
+  const attachmentMessageIds = !params.read.includeAttachments
+    ? attachmentMessageIdsFromRaw(rawMessages)
+    : [];
+
+  const oldestId = rawMessages[0]?.id ?? cursorPayload?.anchorFirstMessageId ?? "";
+  const newestId = rawMessages[rawMessages.length - 1]?.id ?? cursorPayload?.anchorLastMessageId ?? "";
+  const hasAnchors = oldestId.length > 0 && newestId.length > 0;
+
+  let canReadEarlier = false;
+  let canReadLater = false;
+  if (hasAnchors) {
+    if (params.read.aroundMessageId) {
+      // Best-effort edge-aware around continuation.
+      // If the anchor is inside the window, expose the side(s) that clearly
+      // exist in-window. When Discord returned a full window we also allow both
+      // directions, since edges may have more messages outside the window.
+      const anchorIdx = rawMessages.findIndex((m) => m.id === params.read.aroundMessageId);
+      const fullWindow = rawCount === effectiveLimit;
+      if (anchorIdx >= 0) {
+        canReadEarlier = fullWindow || anchorIdx > 0;
+        canReadLater = fullWindow || anchorIdx < rawCount - 1;
+      } else {
+        canReadEarlier = fullWindow;
+        canReadLater = fullWindow;
+      }
+    } else if (cursorPayload) {
+      if (rawCount === 0) {
+        // Exhausted one side; preserve opposite-direction navigation from cursor anchors.
+        canReadEarlier = effectiveDirection !== "earlier";
+        canReadLater = effectiveDirection !== "later";
+      } else {
+        canReadEarlier = true;
+        canReadLater = true;
+      }
+    } else {
+      // Initial latest-window read supports older history traversal.
+      canReadEarlier = rawCount > 0;
+      canReadLater = false;
+    }
+  }
+
+  const makeCursor = (dir: DiscordThreadReadDirection): string | undefined => {
+    if (!hasAnchors) {
+      return undefined;
+    }
+    return encodeThreadReadCursor({
+      v: 1,
+      threadId: params.read.threadId,
+      dir,
+      anchorFirstMessageId: oldestId,
+      anchorLastMessageId: newestId,
+      limit: effectiveLimit,
+      snapshotNewestMessageId: newestId,
+      issuedAt: Date.now(),
+    });
+  };
+
+  const earlierCursor = canReadEarlier ? makeCursor("earlier") : undefined;
+  const laterCursor = canReadLater ? makeCursor("later") : undefined;
+
+  const nextActions: DiscordThreadReadResult["nextActions"] = {
+    aroundMessageTemplate: {
+      accountId: params.read.accountId,
+      threadId: params.read.threadId,
+      aroundMessageId: "",
+      limit: effectiveLimit,
+      includeAttachments: params.read.includeAttachments,
+      includeEmbeds: params.read.includeEmbeds,
+      includeContent: params.read.includeContent,
+      contentMaxChars: params.read.contentMaxChars,
+      includeSystem: params.read.includeSystem,
+    },
+  };
+  if (earlierCursor) {
+    nextActions.readEarlierRequest = {
+      accountId: params.read.accountId,
+      threadId: params.read.threadId,
+      cursor: earlierCursor,
+      direction: "earlier",
+      limit: effectiveLimit,
+      includeContent: params.read.includeContent,
+      contentMaxChars: params.read.contentMaxChars,
+      includeEmbeds: params.read.includeEmbeds,
+      includeAttachments: params.read.includeAttachments,
+      includeSystem: params.read.includeSystem,
+    };
+  }
+  if (laterCursor) {
+    nextActions.readLaterRequest = {
+      accountId: params.read.accountId,
+      threadId: params.read.threadId,
+      cursor: laterCursor,
+      direction: "later",
+      limit: effectiveLimit,
+      includeContent: params.read.includeContent,
+      contentMaxChars: params.read.contentMaxChars,
+      includeEmbeds: params.read.includeEmbeds,
+      includeAttachments: params.read.includeAttachments,
+      includeSystem: params.read.includeSystem,
+    };
+  }
+
+  return {
+    ok: true,
+    threadId: params.read.threadId,
+    messages: projected,
+    returnedCount,
+    rawCount,
+    filteredOutCount,
+    filtered: params.read.includeSystem ? undefined : { systemMessagesOmitted: filteredOutCount },
+    earlierCursor,
+    laterCursor,
+    dedupeKey: "id",
+    window: {
+      oldestId,
+      newestId,
+      boundaryExcludesAnchor: true,
+    },
+    progress: {
+      canReadEarlier: !!earlierCursor,
+      canReadLater: !!laterCursor,
+    },
+    attachmentMessageIds: attachmentMessageIds.length > 0 ? attachmentMessageIds : undefined,
+    capabilities: {
+      attachmentDetail:
+        "Attachment details are available by calling discord-thread-read with a concrete aroundMessageId and includeAttachments=true.",
+    },
+    nextActions,
+  };
 }
 

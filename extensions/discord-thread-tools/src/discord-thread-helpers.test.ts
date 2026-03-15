@@ -3,7 +3,9 @@ import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "openclaw/plugin-sdk";
 import {
   assertThreadBelongsToAllowedParent,
+  encodeThreadReadCursor,
   normalizeReactionEmoji,
+  readThreadMessages,
   resolveDiscordBotToken,
   resolveSandboxContainerWorkdirFromConfig,
   validateAttachmentFilePath,
@@ -463,6 +465,511 @@ describe("validateAttachmentFilePath", () => {
       });
       expect(resolved).toBe(path.resolve(workspaceRoot));
     });
+  });
+});
+
+describe("readThreadMessages", () => {
+  function installThreadFetchMock(messages: Array<Record<string, unknown>>) {
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url.includes("/messages?")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => messages,
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        json: async () => ({
+          id: "thread-1",
+          type: 11,
+          guild_id: "guild-1",
+          parent_id: "parent-1",
+        }),
+      });
+    });
+    // @ts-expect-error override global fetch for test
+    global.fetch = fetchMock;
+    return fetchMock;
+  }
+
+  it("returns neutral navigation actions and earlier cursor for latest-window reads", async () => {
+    installThreadFetchMock([
+      {
+        id: "900000000000000003",
+        type: 0,
+        author: { id: "u3", username: "gamma" },
+        content: "third",
+        timestamp: "2026-03-01T00:00:03.000Z",
+      },
+      {
+        id: "900000000000000002",
+        type: 0,
+        author: { id: "u2", username: "beta" },
+        content: "second",
+        timestamp: "2026-03-01T00:00:02.000Z",
+      },
+      {
+        id: "900000000000000001",
+        type: 0,
+        author: { id: "u1", username: "alpha" },
+        content: "first",
+        timestamp: "2026-03-01T00:00:01.000Z",
+      },
+    ]);
+    const result = await readThreadMessages({
+      token: "bot-token",
+      allowedGuildId: "guild-1",
+      allowedParentChannelIds: ["parent-1"],
+      read: {
+        accountId: "default",
+        threadId: "thread-1",
+        limit: 3,
+        includeContent: true,
+        contentMaxChars: 400,
+        includeSystem: false,
+        includeEmbeds: false,
+        includeAttachments: false,
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.messages.map((m) => m.id)).toEqual([
+      "900000000000000001",
+      "900000000000000002",
+      "900000000000000003",
+    ]);
+    expect(result.window.boundaryExcludesAnchor).toBe(true);
+    expect(result.earlierCursor).toBeTruthy();
+    expect(result.nextActions?.readEarlierRequest).toMatchObject({
+      accountId: "default",
+      threadId: "thread-1",
+      cursor: result.earlierCursor,
+      direction: "earlier",
+      limit: 3,
+      includeContent: true,
+      contentMaxChars: 400,
+      includeEmbeds: false,
+      includeAttachments: false,
+      includeSystem: false,
+    });
+    expect(result.capabilities.attachmentDetail).toMatch(/aroundMessageId/);
+    expect(result.dedupeKey).toBe("id");
+  });
+
+  it("throws when cursor threadId does not match request thread", async () => {
+    installThreadFetchMock([]);
+    const wrongCursor = encodeThreadReadCursor({
+      v: 1,
+      threadId: "thread-2",
+      dir: "earlier",
+      anchorFirstMessageId: "900000000000000001",
+      anchorLastMessageId: "900000000000000003",
+      limit: 3,
+    });
+    await expect(
+      readThreadMessages({
+        token: "bot-token",
+        allowedGuildId: "guild-1",
+        allowedParentChannelIds: ["parent-1"],
+        read: {
+          accountId: "default",
+          threadId: "thread-1",
+          limit: 3,
+          cursor: wrongCursor,
+          includeContent: true,
+          contentMaxChars: 400,
+          includeSystem: false,
+          includeEmbeds: false,
+          includeAttachments: false,
+        },
+      }),
+    ).rejects.toThrow(/does not match requested threadId/);
+  });
+
+  it("uses raw window for attachment metadata when system messages are filtered out", async () => {
+    installThreadFetchMock([
+      {
+        id: "900000000000000005",
+        type: 0,
+        author: { id: "u2", username: "beta" },
+        content: "visible",
+        timestamp: "2026-03-01T00:00:05.000Z",
+      },
+      {
+        id: "900000000000000004",
+        type: 7,
+        author: { id: "u1", username: "alpha" },
+        content: "system with attachment",
+        timestamp: "2026-03-01T00:00:04.000Z",
+        attachments: [{ id: "att-1", filename: "report.txt", url: "https://cdn.example/report.txt" }],
+      },
+    ]);
+    const result = await readThreadMessages({
+      token: "bot-token",
+      allowedGuildId: "guild-1",
+      allowedParentChannelIds: ["parent-1"],
+      read: {
+        accountId: "default",
+        threadId: "thread-1",
+        limit: 2,
+        includeContent: true,
+        contentMaxChars: 400,
+        includeSystem: false,
+        includeEmbeds: false,
+        includeAttachments: false,
+      },
+    });
+
+    expect(result.returnedCount).toBe(1);
+    expect(result.rawCount).toBe(2);
+    expect(result.filteredOutCount).toBe(1);
+    expect(result.filtered).toEqual({ systemMessagesOmitted: 1 });
+    expect(result.attachmentMessageIds).toEqual(["900000000000000004"]);
+  });
+
+  it("uses cursor limit when continuation omits limit", async () => {
+    installThreadFetchMock([
+      {
+        id: "900000000000000010",
+        type: 0,
+        author: { id: "u10", username: "ten" },
+        content: "ten",
+        timestamp: "2026-03-01T00:00:10.000Z",
+      },
+      {
+        id: "900000000000000009",
+        type: 0,
+        author: { id: "u9", username: "nine" },
+        content: "nine",
+        timestamp: "2026-03-01T00:00:09.000Z",
+      },
+    ]);
+    const cursor = encodeThreadReadCursor({
+      v: 1,
+      threadId: "thread-1",
+      dir: "earlier",
+      anchorFirstMessageId: "900000000000000011",
+      anchorLastMessageId: "900000000000000012",
+      limit: 17,
+    });
+    const result = await readThreadMessages({
+      token: "bot-token",
+      allowedGuildId: "guild-1",
+      allowedParentChannelIds: ["parent-1"],
+      read: {
+        accountId: "default",
+        threadId: "thread-1",
+        cursor,
+        includeContent: true,
+        contentMaxChars: 400,
+        includeSystem: false,
+        includeEmbeds: false,
+        includeAttachments: false,
+      },
+    });
+    expect(result.nextActions?.readEarlierRequest?.limit).toBe(17);
+  });
+
+  it("preserves opposite-direction cursor on zero-result continuation", async () => {
+    installThreadFetchMock([]);
+    const cursor = encodeThreadReadCursor({
+      v: 1,
+      threadId: "thread-1",
+      dir: "later",
+      anchorFirstMessageId: "900000000000000100",
+      anchorLastMessageId: "900000000000000200",
+      limit: 10,
+    });
+    const result = await readThreadMessages({
+      token: "bot-token",
+      allowedGuildId: "guild-1",
+      allowedParentChannelIds: ["parent-1"],
+      read: {
+        accountId: "default",
+        threadId: "thread-1",
+        cursor,
+        includeContent: true,
+        contentMaxChars: 400,
+        includeSystem: false,
+        includeEmbeds: false,
+        includeAttachments: false,
+      },
+    });
+    expect(result.returnedCount).toBe(0);
+    expect(result.laterCursor).toBeUndefined();
+    expect(result.earlierCursor).toBeTruthy();
+  });
+
+  it("around mode omits bidirectional cursors on partial windows", async () => {
+    installThreadFetchMock([
+      {
+        id: "900000000000000050",
+        type: 0,
+        author: { id: "u50", username: "fifty" },
+        content: "fifty",
+        timestamp: "2026-03-01T00:00:50.000Z",
+      },
+    ]);
+    const result = await readThreadMessages({
+      token: "bot-token",
+      allowedGuildId: "guild-1",
+      allowedParentChannelIds: ["parent-1"],
+      read: {
+        accountId: "default",
+        threadId: "thread-1",
+        aroundMessageId: "900000000000000050",
+        limit: 30,
+        includeContent: true,
+        contentMaxChars: 400,
+        includeSystem: false,
+        includeEmbeds: false,
+        includeAttachments: false,
+      },
+    });
+    expect(result.earlierCursor).toBeUndefined();
+    expect(result.laterCursor).toBeUndefined();
+  });
+
+  it("around mode can emit bidirectional cursors on full windows", async () => {
+    installThreadFetchMock([
+      {
+        id: "900000000000000030",
+        type: 0,
+        author: { id: "u30", username: "thirty" },
+        content: "thirty",
+        timestamp: "2026-03-01T00:00:30.000Z",
+      },
+      {
+        id: "900000000000000029",
+        type: 0,
+        author: { id: "u29", username: "twenty-nine" },
+        content: "twenty-nine",
+        timestamp: "2026-03-01T00:00:29.000Z",
+      },
+    ]);
+    const result = await readThreadMessages({
+      token: "bot-token",
+      allowedGuildId: "guild-1",
+      allowedParentChannelIds: ["parent-1"],
+      read: {
+        accountId: "default",
+        threadId: "thread-1",
+        aroundMessageId: "900000000000000030",
+        limit: 2,
+        includeContent: true,
+        contentMaxChars: 400,
+        includeSystem: false,
+        includeEmbeds: false,
+        includeAttachments: false,
+      },
+    });
+    expect(result.earlierCursor).toBeTruthy();
+    expect(result.laterCursor).toBeTruthy();
+  });
+
+  it("applies direction override when cursor is present", async () => {
+    installThreadFetchMock([
+      {
+        id: "900000000000000040",
+        type: 0,
+        author: { id: "u40", username: "forty" },
+        content: "forty",
+        timestamp: "2026-03-01T00:00:40.000Z",
+      },
+    ]);
+    const cursor = encodeThreadReadCursor({
+      v: 1,
+      threadId: "thread-1",
+      dir: "earlier",
+      anchorFirstMessageId: "900000000000000050",
+      anchorLastMessageId: "900000000000000060",
+      limit: 5,
+    });
+    const result = await readThreadMessages({
+      token: "bot-token",
+      allowedGuildId: "guild-1",
+      allowedParentChannelIds: ["parent-1"],
+      read: {
+        accountId: "default",
+        threadId: "thread-1",
+        cursor,
+        direction: "later",
+        includeContent: true,
+        contentMaxChars: 400,
+        includeSystem: false,
+        includeEmbeds: false,
+        includeAttachments: false,
+      },
+    });
+    expect(result.nextActions?.readLaterRequest?.direction).toBe("later");
+  });
+
+  it("returns filtered-only windows with continuation metadata", async () => {
+    installThreadFetchMock([
+      {
+        id: "900000000000000070",
+        type: 7,
+        author: { id: "u70", username: "system" },
+        content: "system message",
+        timestamp: "2026-03-01T00:00:70.000Z",
+      },
+    ]);
+    const result = await readThreadMessages({
+      token: "bot-token",
+      allowedGuildId: "guild-1",
+      allowedParentChannelIds: ["parent-1"],
+      read: {
+        accountId: "default",
+        threadId: "thread-1",
+        limit: 1,
+        includeContent: true,
+        contentMaxChars: 400,
+        includeSystem: false,
+        includeEmbeds: false,
+        includeAttachments: false,
+      },
+    });
+    expect(result.messages).toEqual([]);
+    expect(result.rawCount).toBe(1);
+    expect(result.returnedCount).toBe(0);
+    expect(result.filteredOutCount).toBe(1);
+    expect(result.earlierCursor).toBeTruthy();
+  });
+
+  it("projects attachment and embed details when requested", async () => {
+    installThreadFetchMock([
+      {
+        id: "900000000000000080",
+        type: 0,
+        author: { id: "u80", username: "eighty" },
+        content: "rich message",
+        timestamp: "2026-03-01T00:00:80.000Z",
+        attachments: [
+          {
+            id: "att-80",
+            filename: "log.txt",
+            content_type: "text/plain",
+            size: 12,
+            url: "https://cdn.example/log.txt",
+            proxy_url: "https://proxy.example/log.txt",
+          },
+        ],
+        embeds: [
+          {
+            type: "link",
+            title: "Example",
+            description: "desc",
+            url: "https://example.com",
+          },
+        ],
+      },
+    ]);
+    const result = await readThreadMessages({
+      token: "bot-token",
+      allowedGuildId: "guild-1",
+      allowedParentChannelIds: ["parent-1"],
+      read: {
+        accountId: "default",
+        threadId: "thread-1",
+        limit: 1,
+        includeContent: true,
+        contentMaxChars: 400,
+        includeSystem: false,
+        includeEmbeds: true,
+        includeAttachments: true,
+      },
+    });
+    expect(result.messages[0]?.attachments?.[0]).toMatchObject({
+      id: "att-80",
+      filename: "log.txt",
+      contentType: "text/plain",
+      size: 12,
+      url: "https://cdn.example/log.txt",
+      proxyUrl: "https://proxy.example/log.txt",
+    });
+    expect(result.messages[0]?.embeds?.[0]).toMatchObject({
+      type: "link",
+      title: "Example",
+      description: "desc",
+      url: "https://example.com",
+    });
+  });
+
+  it("truncates content when contentMaxChars is set", async () => {
+    installThreadFetchMock([
+      {
+        id: "900000000000000090",
+        type: 0,
+        author: { id: "u90", username: "ninety" },
+        content: "abcdefghijklmnopqrstuvwxyz",
+        timestamp: "2026-03-01T00:00:90.000Z",
+      },
+    ]);
+    const result = await readThreadMessages({
+      token: "bot-token",
+      allowedGuildId: "guild-1",
+      allowedParentChannelIds: ["parent-1"],
+      read: {
+        accountId: "default",
+        threadId: "thread-1",
+        limit: 1,
+        includeContent: true,
+        contentMaxChars: 5,
+        includeSystem: false,
+        includeEmbeds: false,
+        includeAttachments: false,
+      },
+    });
+    expect(result.messages[0]?.content).toMatch(/^abcde \.\.\.\(truncated\)$/);
+  });
+
+  it("omits content when includeContent is false", async () => {
+    installThreadFetchMock([
+      {
+        id: "900000000000000091",
+        type: 0,
+        author: { id: "u91", username: "ninety-one" },
+        content: "should be hidden",
+        timestamp: "2026-03-01T00:00:91.000Z",
+      },
+    ]);
+    const result = await readThreadMessages({
+      token: "bot-token",
+      allowedGuildId: "guild-1",
+      allowedParentChannelIds: ["parent-1"],
+      read: {
+        accountId: "default",
+        threadId: "thread-1",
+        limit: 1,
+        includeContent: false,
+        contentMaxChars: 0,
+        includeSystem: false,
+        includeEmbeds: false,
+        includeAttachments: false,
+      },
+    });
+    expect(result.messages[0]?.content).toBeUndefined();
+  });
+
+  it("throws on invalid cursor payload", async () => {
+    installThreadFetchMock([]);
+    await expect(
+      readThreadMessages({
+        token: "bot-token",
+        allowedGuildId: "guild-1",
+        allowedParentChannelIds: ["parent-1"],
+        read: {
+          accountId: "default",
+          threadId: "thread-1",
+          cursor: "not-a-valid-cursor",
+          includeContent: true,
+          contentMaxChars: 400,
+          includeSystem: false,
+          includeEmbeds: false,
+          includeAttachments: false,
+        },
+      }),
+    ).rejects.toThrow(/Invalid cursor/);
   });
 });
 

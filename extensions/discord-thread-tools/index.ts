@@ -20,6 +20,8 @@
  * - `discord-thread-react`: react to a specific message in a thread.
  * - `discord-thread-attach`: send a file attachment into a thread, with an
  *   optional caption, from workspace/container paths.
+ * - `discord-thread-read`: read a thread window with neutral pagination
+ *   primitives (`earlier`/`later`) and optional detail expansion flags.
  * - `discord-channel-react`: react to a message in any channel (guild channel,
  *   thread, or DM); channel must be in the configured guild when applicable.
  *
@@ -62,6 +64,9 @@
  *   may still pass a plugin tool context with `agentId` set to a default; it may
  *   not correspond to an active agent session. In a typical agent + Discord run,
  *   `ctx.agentId` is the id of the agent executing the tool (set by the runtime).
+ * - The read tool is objective-neutral: it returns factual message data plus
+ *   navigation actions (`readEarlierRequest`, `readLaterRequest`,
+ *   `aroundMessageTemplate`). It does not inject objective-specific instructions.
  *
  * What is *not* replicated from core `message`
  * --------------------------------------------
@@ -86,6 +91,27 @@
  * - Until such helpers exist, this plugin keeps its own minimal HTTP and
  *   attachment logic inside the extension, while relying on the SDK for
  *   config, tokens, and media loading.
+ *
+ * Read tool contract notes
+ * ------------------------
+ * - `discord-thread-read` is intentionally objective-neutral. It returns facts
+ *   and navigation primitives, but it does not infer or inject user intent
+ *   (for example, "you should now search for attachments").
+ * - External navigation uses `earlier` / `later` terminology because "next"
+ *   and "previous" are perspective-dependent for LLM callers.
+ * - Cursor replay is anchor-relative for a live thread; `later` reads may
+ *   include newly arrived messages by design.
+ * - Returned `nextActions` contain full executable request objects with
+ *   explicit effective optional values so callers can replay without hidden
+ *   defaults.
+ * - Attachment reads return metadata plus URLs only (no inline blobs), and
+ *   attachment follow-up behavior is capability-based rather than auto-guided.
+ * - `includeSystem=false` is a presentation filter only; raw-window anchors and
+ *   counters (`rawCount`, `filteredOutCount`, and optional `filtered`) remain
+ *   grounded in the fetched Discord window for stable continuation behavior.
+ * - Around reads (`aroundMessageId`) are a neutral way to center context on a
+ *   message. Attachment details are available by combining around reads with
+ *   `includeAttachments=true` when callers explicitly choose that path.
  */
 import type {
   AnyAgentTool,
@@ -94,6 +120,7 @@ import type {
   OpenClawPluginToolContext,
 } from "openclaw/plugin-sdk";
 import {
+  readBooleanParam,
   jsonResult,
   loadWebMedia,
   readStringParam,
@@ -109,6 +136,7 @@ import {
   formatDiscordError,
   normalizeReactionEmoji,
   postAttachmentMessage,
+  readThreadMessages,
   resolveDiscordBotToken,
   resolveSandboxContainerWorkdirFromConfig,
   safeJson,
@@ -131,6 +159,26 @@ function requireConfig(cfg?: OpenClawConfig): OpenClawConfig {
     throw new Error("OpenClaw config is not available.");
   }
   return cfg;
+}
+
+function readOptionalIntegerParam(
+  params: Record<string, unknown>,
+  key: string,
+): number | undefined {
+  const raw = params[key];
+  if (raw == null) {
+    return undefined;
+  }
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return Math.trunc(raw);
+  }
+  if (typeof raw === "string" && raw.trim()) {
+    const parsed = Number(raw.trim());
+    if (Number.isFinite(parsed)) {
+      return Math.trunc(parsed);
+    }
+  }
+  throw new Error(`${key} must be an integer.`);
 }
 
 type DiscordThreadToolsConfig = {
@@ -564,6 +612,141 @@ function createDiscordThreadAttachTool(
   };
 }
 
+function createDiscordThreadReadTool(
+  ctx: OpenClawPluginToolContext,
+  pluginCfg: DiscordThreadToolsConfig,
+): AnyAgentTool {
+  return {
+    name: "discord-thread-read",
+    label: "Discord Thread Read",
+    description:
+      "Read messages from a Discord thread with neutral earlier/later pagination primitives.",
+    parameters: {
+      type: "object",
+      properties: {
+        accountId: {
+          type: "string",
+          description:
+            "Discord account id to read from (e.g. kaylee, nexus). This is required.",
+        },
+        threadId: {
+          type: "string",
+          description: "Discord thread ID to read from.",
+        },
+        limit: {
+          type: "integer",
+          description: "Number of messages to read (1-100, default 30).",
+        },
+        cursor: {
+          type: "string",
+          description: "Opaque cursor from a previous discord-thread-read result.",
+        },
+        direction: {
+          type: "string",
+          enum: ["earlier", "later"],
+          description:
+            "Optional continuation direction override when cursor is present.",
+        },
+        aroundMessageId: {
+          type: "string",
+          description: "Optional message ID to center an around-read window.",
+        },
+        includeContent: {
+          type: "boolean",
+          description: "Include message content (default true).",
+        },
+        contentMaxChars: {
+          type: "integer",
+          description: "Maximum content characters per message (0-4000, default 400).",
+        },
+        includeSystem: {
+          type: "boolean",
+          description: "Include system messages (default false).",
+        },
+        includeEmbeds: {
+          type: "boolean",
+          description: "Include compact embed metadata (default false).",
+        },
+        includeAttachments: {
+          type: "boolean",
+          description: "Include compact attachment metadata and URLs (default false).",
+        },
+      },
+      required: ["accountId", "threadId"],
+      additionalProperties: false,
+    },
+    async execute(_toolCallId, rawArgs) {
+      ensureDiscordContext(ctx);
+      const cfg = requireConfig(ctx.config);
+      const args = rawArgs as Record<string, unknown>;
+      const accountId = readStringParam(args, "accountId", { required: true });
+      const threadId = readStringParam(args, "threadId", { required: true });
+      const cursor = readStringParam(args, "cursor");
+      const directionRaw = readStringParam(args, "direction");
+      const aroundMessageId = readStringParam(args, "aroundMessageId");
+      const limit = readOptionalIntegerParam(args, "limit");
+      const includeContent = readBooleanParam(args, "includeContent") ?? true;
+      const contentMaxChars = readOptionalIntegerParam(args, "contentMaxChars") ?? 400;
+      const includeSystem = readBooleanParam(args, "includeSystem") ?? false;
+      const includeEmbeds = readBooleanParam(args, "includeEmbeds") ?? false;
+      const includeAttachments = readBooleanParam(args, "includeAttachments") ?? false;
+
+      if (limit != null && (limit < 1 || limit > 100)) {
+        throw new Error(`limit must be between 1 and 100 (got ${limit}).`);
+      }
+      if (includeContent && (contentMaxChars < 0 || contentMaxChars > 4000)) {
+        throw new Error(
+          `contentMaxChars must be between 0 and 4000 (got ${contentMaxChars}).`,
+        );
+      }
+      if (aroundMessageId && !/^\d{16,22}$/.test(aroundMessageId.trim())) {
+        throw new Error("aroundMessageId must be a valid Discord message id.");
+      }
+      if (cursor && aroundMessageId) {
+        throw new Error("cursor and aroundMessageId are mutually exclusive.");
+      }
+      if (directionRaw && !cursor) {
+        throw new Error("direction requires cursor.");
+      }
+      if (directionRaw && aroundMessageId) {
+        throw new Error("direction cannot be used with aroundMessageId.");
+      }
+      let direction: "earlier" | "later" | undefined;
+      if (cursor && directionRaw) {
+        if (directionRaw !== "earlier" && directionRaw !== "later") {
+          throw new Error(`direction must be earlier or later (got ${directionRaw}).`);
+        }
+        direction = directionRaw;
+      }
+
+      const token = resolveDiscordBotToken({ cfg, accountId });
+      const guildId = pluginCfg.guildId ?? DEFAULT_DISCORD_GUILD_ID;
+      const parentChannels = pluginCfg.parentChannels ?? DEFAULT_DISCORD_PARENT_CHANNELS;
+
+      const result = await readThreadMessages({
+        token,
+        allowedGuildId: guildId,
+        allowedParentChannelIds: Object.values(parentChannels),
+        read: {
+          accountId,
+          threadId,
+          limit: limit ?? undefined,
+          cursor: cursor ?? undefined,
+          direction,
+          aroundMessageId: aroundMessageId ?? undefined,
+          includeContent,
+          contentMaxChars,
+          includeSystem,
+          includeEmbeds,
+          includeAttachments,
+        },
+      });
+
+      return jsonResult(result);
+    },
+  };
+}
+
 function createDiscordDmSendTool(ctx: OpenClawPluginToolContext): AnyAgentTool {
   return {
     name: "discord-dm-send",
@@ -884,7 +1067,7 @@ const plugin = {
   id: "discord-thread-tools",
   name: "Discord Thread Tools",
   description:
-    "Intentful Discord thread and DM tools (create/send/react/attach).",
+    "Intentful Discord thread and DM tools (create/send/react/attach/read).",
   configSchema: {},
   register(api: OpenClawPluginApi) {
     const pluginCfg = (api.pluginConfig ?? {}) as DiscordThreadToolsConfig;
@@ -894,6 +1077,7 @@ const plugin = {
         createDiscordThreadSendTool(ctx, pluginCfg),
         createDiscordThreadReactTool(ctx, pluginCfg),
         createDiscordThreadAttachTool(ctx, pluginCfg),
+        createDiscordThreadReadTool(ctx, pluginCfg),
         createDiscordChannelReactTool(ctx, pluginCfg),
         createDiscordDmSendTool(ctx),
         createDiscordDmReactTool(ctx),

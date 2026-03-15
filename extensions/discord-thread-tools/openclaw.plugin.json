@@ -1,7 +1,7 @@
 {
   "id": "discord-thread-tools",
   "name": "Discord Thread Tools",
-  "description": "Intentful Discord thread tools (create/send/react/attach).",
+  "description": "Intentful Discord thread tools (create/send/react/attach/read).",
   "version": "0.0.1",
   "entry": "./index.ts",
   "kind": "plugin",
