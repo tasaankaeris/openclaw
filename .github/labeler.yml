@@ -260,3 +260,7 @@
   - changed-files:
       - any-glob-to-any-file:
           - "extensions/pixel-space/**"
+"extensions: git-worktree":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "extensions/git-worktree/**"

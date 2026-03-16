@@ -1,0 +1,17 @@
+{
+  "name": "@openclaw/git-worktree",
+  "version": "2026.3.2",
+  "private": true,
+  "description": "OpenClaw worktree branch-swap plugin for sandboxed agents",
+  "type": "module",
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  },
+  "dependencies": {
+    "@sinclair/typebox": "0.34.48"
+  },
+  "devDependencies": {
+    "openclaw": "workspace:*",
+    "vitest": "^2.1.0"
+  }
+}

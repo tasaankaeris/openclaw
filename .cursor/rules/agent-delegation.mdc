@@ -29,6 +29,59 @@ Choose subagent type based on task capabilities needed:
 | Writing/editing 1-2 files | `generalPurpose` |
 | Multi-file implementation | `task-executor` |
 | Code review, audits | `critical-reviewer` |
+| Large coordinated refactors (see three-layer threshold below) | `task-orchestrator` |
+
+## Three-Layer Delegation
+
+For large tasks, insert a `task-orchestrator` between this agent and workers. The orchestrator owns a major piece end-to-end — it explores, delegates to `task-executor`, runs `critical-reviewer`, and verifies within its scope. The top-level agent reviews the final report and owns overall direction.
+
+### When to Use (Tipping Point)
+
+Use `task-orchestrator` when the task meets **either** condition:
+
+- **Scale trigger** — Changes span ≥ 10 files across ≥ 2 modules/packages, with dependencies between the change streams (not purely parallel independent edits)
+- **Coordination trigger** — Completing the task requires ≥ 4 `task-executor` calls where some calls depend on outputs of earlier ones
+
+Stay at two-layer (direct `task-executor`) when:
+- Total file changes ≤ 9, or all changes are fully independent (safe as parallel non-overlapping streams)
+- Task needs ≤ 3 `task-executor` calls total with no inter-call dependencies
+
+### Decision Examples
+
+| Scenario | Threshold Met? | Dispatch |
+|----------|---------------|----------|
+| Fix a bug in 2 files | No | `task-executor` |
+| Add a feature touching 5 files in one module | No | `task-executor` |
+| Refactor 50 files to a new pattern across modules | Yes (scale) | `task-orchestrator` |
+| Migrate a data model + update all 30 callers | Yes (scale + coordination) | `task-orchestrator` |
+| Add an interface + update all 12 implementors with review before callers | Yes (coordination) | `task-orchestrator` |
+| Parallel independent changes across 4 modules, no inter-dependency | No (parallel, not coordinated) | parallel `task-executor` |
+
+### How to Delegate
+
+```
+subagent_type: "task-orchestrator"
+readonly: false
+description: "[scope summary, e.g. 'Migrate X pattern across infra module']"
+prompt: |
+  [Full task brief including:]
+  - Scope: exact files/directories owned by this orchestrator
+  - Goal: what done looks like
+  - Constraints: what not to change
+  - Key patterns/examples from the codebase
+  - Review requirement: critical-reviewer must run before completion
+```
+
+The prompt must define a clear scope boundary. The orchestrator manages explore → execute → review within that boundary. Do not micromanage individual steps.
+
+### What the Orchestrator Returns
+
+The orchestrator returns a completion report. Review it for:
+- Changed files list (spot-check 1-2 for correctness)
+- Test/lint gate status
+- Any unresolved risks flagged for top-level awareness
+
+The orchestrator runs its own `critical-reviewer` internally within its scope. At the end of all orchestrator work, the top-level agent should run a final `critical-reviewer` pass on the full git diff as a completeness gate — for example: "Review all changes made since the refactor began." This catches cross-cutting issues, drift between orchestrator scopes, and anything the internal reviews missed.
 
 ## Model Selection
 

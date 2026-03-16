@@ -1,0 +1,46 @@
+{
+  "id": "git-worktree",
+  "name": "Git Worktree",
+  "description": "Safe worktree branch-swap tool for sandboxed agents. Switches assigned worktree to target branch with strict validation.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "assignments": {
+        "type": "object",
+        "description": "Per-agent worktree and bare repo path assignments.",
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["worktreePath", "bareRepoPath"],
+          "properties": {
+            "worktreePath": {
+              "type": "string",
+              "description": "Absolute POSIX path to the agent's assigned worktree."
+            },
+            "bareRepoPath": {
+              "type": "string",
+              "description": "Absolute POSIX path to the bare repository."
+            }
+          }
+        }
+      },
+      "allowedBaseRefs": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": ["origin/main"],
+        "description": "Allowed base refs for branch creation (e.g. origin/main)."
+      }
+    }
+  },
+  "uiHints": {
+    "assignments": {
+      "label": "Agent Assignments",
+      "help": "Map agent IDs to worktreePath and bareRepoPath. Each agent gets one assigned worktree."
+    },
+    "allowedBaseRefs": {
+      "label": "Allowed Base Refs",
+      "help": "List of refs allowed as base when creating new branches (default: origin/main)."
+    }
+  }
+}
